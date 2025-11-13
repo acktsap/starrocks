@@ -23,8 +23,12 @@
 #include "common/logging.h"
 #include "common/object_pool.h"
 #include "exec/hash_joiner.h"
+<<<<<<< HEAD
 #include "exec/join_hash_map.h"
 #include "exprs/agg/distinct.h"
+=======
+#include "exec/join/join_hash_map.h"
+>>>>>>> 7b3e298b3e ([Enhancement] Enable rapid memory release on hash table OOM (#65216))
 #include "exprs/expr_context.h"
 #include "gutil/casts.h"
 #include "runtime/descriptors.h"
