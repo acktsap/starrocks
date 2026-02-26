@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>StarRocks Storage Architecture — Physical File Structure</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1117; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; color: #c9d1d9; padding: 30px 20px; }
+  h1 { text-align: center; font-size: 26px; color: #58a6ff; margin-bottom: 6px; }
+  h2 { text-align: center; font-size: 18px; color: #d2a8ff; margin: 40px 0 10px; }
+  .subtitle { text-align: center; font-size: 13px; color: #8b949e; margin-bottom: 30px; }
+  .section-desc { text-align: center; font-size: 12px; color: #8b949e; margin-bottom: 20px; }
+  svg { display: block; margin: 0 auto; }
+  .legend { display: flex; justify-content: center; gap: 24px; margin-top: 24px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #8b949e; }
+  .legend-color { width: 14px; height: 14px; border-radius: 3px; }
+  .divider { border: none; border-top: 1px solid #21262d; margin: 40px auto; width: 80%; }
+</style>
+</head>
+<body>
+
+<h1>StarRocks Storage Architecture</h1>
+<p class="subtitle">Tablet → Rowset → Segment → Column / Index — 논리 계층 + 물리 파일 구조</p>
+
+<!-- ================================================================== -->
+<!-- PART 1: LOGICAL HIERARCHY                                          -->
+<!-- ================================================================== -->
+
+<h2>Part 1 — 논리 계층 구조 (Logical Hierarchy)</h2>
+<p class="section-desc">메모리/코드상의 객체 관계</p>
+
+<svg width="1100" height="1540" viewBox="0 0 1100 1540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#484f58"/></marker>
+    <marker id="arrow-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#58a6ff"/></marker>
+    <filter id="shadow"><feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#000" flood-opacity="0.5"/></filter>
+    <linearGradient id="tabletGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3a5c"/><stop offset="100%" stop-color="#0f2440"/></linearGradient>
+    <linearGradient id="rowsetGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#2a1f4e"/><stop offset="100%" stop-color="#1a1238"/></linearGradient>
+    <linearGradient id="segmentGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3a2e"/><stop offset="100%" stop-color="#0f2a1e"/></linearGradient>
+    <linearGradient id="columnGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3a2a1a"/><stop offset="100%" stop-color="#2a1a0a"/></linearGradient>
+    <linearGradient id="indexGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3a1a2a"/><stop offset="100%" stop-color="#2a0f1a"/></linearGradient>
+  </defs>
+
+  <!-- ========== TABLET ========== -->
+  <rect x="50" y="20" width="1000" height="220" rx="12" fill="url(#tabletGrad)" stroke="#1f6feb" stroke-width="2" filter="url(#shadow)"/>
+  <text x="80" y="52" font-size="18" font-weight="700" fill="#58a6ff">Tablet</text>
+  <text x="170" y="52" font-size="12" fill="#484f58">be/src/storage/tablet.h</text>
+  <text x="80" y="76" font-size="12" fill="#8b949e">테이블 파티션의 물리적 데이터 단위 (DataDir에 소속)</text>
+  <rect x="80" y="92" width="280" height="130" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="96" y="112" font-size="12" font-weight="600" fill="#c9d1d9">핵심 멤버</text>
+  <text x="96" y="132" font-size="11" fill="#7ee787" font-family="monospace">_tablet_meta</text><text x="230" y="132" font-size="11" fill="#8b949e">스키마/상태/버전</text>
+  <text x="96" y="150" font-size="11" fill="#7ee787" font-family="monospace">_rs_version_map</text><text x="230" y="150" font-size="11" fill="#8b949e">버전→Rowset</text>
+  <text x="96" y="168" font-size="11" fill="#7ee787" font-family="monospace">_updates</text><text x="230" y="168" font-size="11" fill="#8b949e">PK 테이블용</text>
+  <text x="96" y="186" font-size="11" fill="#7ee787" font-family="monospace">_keys_type</text><text x="230" y="186" font-size="11" fill="#8b949e">DUP/UNQ/PK/AGG</text>
+  <text x="96" y="204" font-size="11" fill="#7ee787" font-family="monospace">_cumulative_point</text><text x="230" y="204" font-size="11" fill="#8b949e">compaction 경계</text>
+  <rect x="400" y="92" width="620" height="50" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="416" y="112" font-size="12" font-weight="600" fill="#c9d1d9">상태 전이</text>
+  <rect x="416" y="120" width="76" height="16" rx="3" fill="#1f6feb"/><text x="425" y="131" font-size="9" fill="#fff">NOTREADY</text>
+  <text x="496" y="131" font-size="11" fill="#484f58">→</text>
+  <rect x="510" y="120" width="66" height="16" rx="3" fill="#238636"/><text x="519" y="131" font-size="9" fill="#fff">RUNNING</text>
+  <text x="580" y="131" font-size="11" fill="#484f58">→</text>
+  <rect x="594" y="120" width="88" height="16" rx="3" fill="#9e6a03"/><text x="600" y="131" font-size="9" fill="#fff">TOMBSTONED</text>
+  <text x="686" y="131" font-size="11" fill="#484f58">→</text>
+  <rect x="700" y="120" width="66" height="16" rx="3" fill="#da3633"/><text x="709" y="131" font-size="9" fill="#fff">STOPPED</text>
+  <text x="770" y="131" font-size="11" fill="#484f58">→</text>
+  <rect x="784" y="120" width="76" height="16" rx="3" fill="#6e40c9"/><text x="790" y="131" font-size="9" fill="#fff">SHUTDOWN</text>
+  <rect x="400" y="152" width="620" height="68" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="416" y="172" font-size="12" font-weight="600" fill="#c9d1d9">동시성 제어 (Locks)</text>
+  <text x="416" y="192" font-size="11" fill="#ff7b72" font-family="monospace">_meta_lock</text>
+  <text x="540" y="192" font-size="11" fill="#ff7b72" font-family="monospace">_base_lock</text>
+  <text x="650" y="192" font-size="11" fill="#ff7b72" font-family="monospace">_cumulative_lock</text>
+  <text x="416" y="208" font-size="11" fill="#ff7b72" font-family="monospace">_ingest_lock</text>
+  <text x="540" y="208" font-size="11" fill="#ff7b72" font-family="monospace">_schema_lock</text>
+  <text x="650" y="208" font-size="11" fill="#ff7b72" font-family="monospace">_migration_lock</text>
+
+  <line x1="550" y1="240" x2="550" y2="280" stroke="#484f58" stroke-width="2" marker-end="url(#arrow)" stroke-dasharray="6,3"/>
+  <text x="560" y="265" font-size="11" fill="#58a6ff">contains 1:N</text>
+
+  <!-- ========== ROWSET ========== -->
+  <rect x="50" y="280" width="1000" height="220" rx="12" fill="url(#rowsetGrad)" stroke="#8957e5" stroke-width="2" filter="url(#shadow)"/>
+  <text x="80" y="312" font-size="18" font-weight="700" fill="#d2a8ff">Rowset</text>
+  <text x="170" y="312" font-size="12" fill="#484f58">be/src/storage/rowset/rowset.h</text>
+  <text x="80" y="336" font-size="12" fill="#8b949e">한 번의 load/compaction으로 생성되는 불변(immutable) 데이터 단위</text>
+  <rect x="80" y="350" width="280" height="130" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="96" y="370" font-size="12" font-weight="600" fill="#c9d1d9">핵심 멤버</text>
+  <text x="96" y="390" font-size="11" fill="#7ee787" font-family="monospace">_rowset_meta</text><text x="230" y="390" font-size="11" fill="#8b949e">버전/행수/크기</text>
+  <text x="96" y="408" font-size="11" fill="#7ee787" font-family="monospace">_segments</text><text x="230" y="408" font-size="11" fill="#8b949e">vector&lt;Segment&gt;</text>
+  <text x="96" y="426" font-size="11" fill="#7ee787" font-family="monospace">_schema</text><text x="230" y="426" font-size="11" fill="#8b949e">스키마 스냅샷</text>
+  <text x="96" y="444" font-size="11" fill="#7ee787" font-family="monospace">_refs_by_reader</text><text x="230" y="444" font-size="11" fill="#8b949e">참조 카운트</text>
+  <text x="96" y="462" font-size="11" fill="#7ee787" font-family="monospace">_rowset_state_machine</text>
+  <rect x="400" y="350" width="300" height="130" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="416" y="370" font-size="12" font-weight="600" fill="#c9d1d9">RowsetMeta 주요 필드</text>
+  <text x="416" y="392" font-size="11" fill="#d2a8ff" font-family="monospace">rowset_id</text><text x="530" y="392" font-size="11" fill="#8b949e">고유 식별자</text>
+  <text x="416" y="410" font-size="11" fill="#d2a8ff" font-family="monospace">version [s, e]</text><text x="530" y="410" font-size="11" fill="#8b949e">버전 범위</text>
+  <text x="416" y="428" font-size="11" fill="#d2a8ff" font-family="monospace">num_rows</text><text x="530" y="428" font-size="11" fill="#8b949e">총 행 수</text>
+  <text x="416" y="446" font-size="11" fill="#d2a8ff" font-family="monospace">total_disk_size</text><text x="530" y="446" font-size="11" fill="#8b949e">디스크 사용량</text>
+  <text x="416" y="464" font-size="11" fill="#d2a8ff" font-family="monospace">num_segments</text><text x="530" y="464" font-size="11" fill="#8b949e">세그먼트 수</text>
+  <rect x="740" y="350" width="280" height="55" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="756" y="370" font-size="12" font-weight="600" fill="#c9d1d9">상태 전이</text>
+  <rect x="756" y="380" width="70" height="16" rx="3" fill="#6e40c9"/><text x="762" y="391" font-size="9" fill="#fff">UNLOADED</text>
+  <text x="830" y="391" font-size="11" fill="#484f58">→</text>
+  <rect x="842" y="380" width="56" height="16" rx="3" fill="#238636"/><text x="850" y="391" font-size="9" fill="#fff">LOADED</text>
+  <text x="902" y="391" font-size="11" fill="#484f58">→</text>
+  <rect x="914" y="380" width="80" height="16" rx="3" fill="#9e6a03"/><text x="918" y="391" font-size="9" fill="#fff">UNLOADING</text>
+  <rect x="740" y="415" width="280" height="65" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="756" y="435" font-size="12" font-weight="600" fill="#c9d1d9">설계 원칙</text>
+  <text x="756" y="455" font-size="11" fill="#8b949e">- 생성 후 절대 수정 불가 (Immutable)</text>
+  <text x="756" y="471" font-size="11" fill="#8b949e">- Compaction → 새 Rowset 생성</text>
+
+  <line x1="550" y1="500" x2="550" y2="540" stroke="#484f58" stroke-width="2" marker-end="url(#arrow)" stroke-dasharray="6,3"/>
+  <text x="560" y="525" font-size="11" fill="#58a6ff">contains 1:N</text>
+
+  <!-- ========== SEGMENT ========== -->
+  <rect x="50" y="540" width="1000" height="280" rx="12" fill="url(#segmentGrad)" stroke="#238636" stroke-width="2" filter="url(#shadow)"/>
+  <text x="80" y="572" font-size="18" font-weight="700" fill="#7ee787">Segment</text>
+  <text x="180" y="572" font-size="12" fill="#484f58">be/src/storage/rowset/segment.h</text>
+  <text x="80" y="596" font-size="12" fill="#8b949e">하나의 물리적 디스크 파일 — 컬럼별 데이터 + 인덱스 포함</text>
+  <rect x="80" y="612" width="280" height="120" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="96" y="632" font-size="12" font-weight="600" fill="#c9d1d9">핵심 멤버</text>
+  <text x="96" y="652" font-size="11" fill="#7ee787" font-family="monospace">_column_readers</text><text x="230" y="652" font-size="11" fill="#8b949e">컬럼별 리더</text>
+  <text x="96" y="670" font-size="11" fill="#7ee787" font-family="monospace">_num_rows</text><text x="230" y="670" font-size="11" fill="#8b949e">총 행 수</text>
+  <text x="96" y="688" font-size="11" fill="#7ee787" font-family="monospace">_sk_index_decoder</text><text x="230" y="688" font-size="11" fill="#8b949e">Short Key 인덱스</text>
+  <text x="96" y="706" font-size="11" fill="#7ee787" font-family="monospace">_segment_id</text><text x="230" y="706" font-size="11" fill="#8b949e">세그먼트 번호</text>
+  <rect x="400" y="612" width="300" height="190" rx="6" fill="#161b22" stroke="#238636" stroke-width="1.5"/>
+  <text x="416" y="632" font-size="12" font-weight="600" fill="#7ee787">세그먼트 파일 개요</text>
+  <rect x="420" y="644" width="260" height="36" rx="4" fill="#1a3a2e" stroke="#30363d"/>
+  <text x="500" y="666" font-size="12" fill="#7ee787" text-anchor="middle">Data Pages (컬럼별 압축 데이터)</text>
+  <rect x="420" y="688" width="260" height="36" rx="4" fill="#1a3a2e" stroke="#30363d"/>
+  <text x="500" y="710" font-size="12" fill="#7ee787" text-anchor="middle">Index Pages (메타데이터)</text>
+  <rect x="420" y="732" width="260" height="36" rx="4" fill="#1a3a2e" stroke="#30363d"/>
+  <text x="500" y="754" font-size="12" fill="#7ee787" text-anchor="middle">Segment Footer + Magic</text>
+  <text x="710" y="710" font-size="11" fill="#484f58">→ Part 2에서 상세</text>
+  <rect x="740" y="612" width="280" height="55" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="756" y="632" font-size="12" font-weight="600" fill="#c9d1d9">Lazy Loading</text>
+  <text x="756" y="652" font-size="11" fill="#8b949e">인덱스는 필요할 때 1회만 로드</text>
+  <text x="756" y="668" font-size="11" fill="#8b949e">(thread-safe, once initialization)</text>
+  <rect x="740" y="678" width="280" height="80" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="756" y="698" font-size="12" font-weight="600" fill="#c9d1d9">주요 API</text>
+  <text x="756" y="718" font-size="11" fill="#79c0ff" font-family="monospace">open()</text><text x="856" y="718" font-size="11" fill="#8b949e">메타 로드</text>
+  <text x="756" y="736" font-size="11" fill="#79c0ff" font-family="monospace">new_iterator()</text><text x="882" y="736" font-size="11" fill="#8b949e">행 순회</text>
+  <text x="756" y="754" font-size="11" fill="#79c0ff" font-family="monospace">new_column_iterator()</text>
+
+  <line x1="550" y1="820" x2="550" y2="860" stroke="#484f58" stroke-width="2" marker-end="url(#arrow)" stroke-dasharray="6,3"/>
+  <text x="560" y="845" font-size="11" fill="#58a6ff">contains 1:N (컬럼 수만큼)</text>
+
+  <!-- ========== COLUMN READER ========== -->
+  <rect x="50" y="860" width="1000" height="140" rx="12" fill="url(#columnGrad)" stroke="#d29922" stroke-width="2" filter="url(#shadow)"/>
+  <text x="80" y="892" font-size="18" font-weight="700" fill="#e3b341">ColumnReader</text>
+  <text x="240" y="892" font-size="12" fill="#484f58">be/src/storage/rowset/column_reader.h</text>
+  <text x="80" y="916" font-size="12" fill="#8b949e">컬럼 단위 데이터 접근 — 각 컬럼이 자체 인덱스를 보유</text>
+  <rect x="80" y="930" width="440" height="52" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="96" y="950" font-size="11" fill="#e3b341" font-family="monospace">_encoding_info</text><text x="220" y="950" font-size="11" fill="#8b949e">Plain / RLE / Dictionary 등</text>
+  <text x="96" y="968" font-size="11" fill="#e3b341" font-family="monospace">_column_type</text><text x="220" y="968" font-size="11" fill="#8b949e">LogicalType (INT, VARCHAR, ...)</text>
+  <rect x="560" y="930" width="460" height="52" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="576" y="950" font-size="11" fill="#e3b341" font-family="monospace">_ordinal_index</text>
+  <text x="576" y="968" font-size="11" fill="#e3b341" font-family="monospace">_zonemap_index  _bitmap_index  _bloom_filter_index</text>
+
+  <line x1="550" y1="1000" x2="550" y2="1040" stroke="#484f58" stroke-width="2" marker-end="url(#arrow)" stroke-dasharray="6,3"/>
+  <text x="560" y="1025" font-size="11" fill="#58a6ff">owns indexes</text>
+
+  <!-- ========== INDEX LAYER ========== -->
+  <rect x="50" y="1040" width="1000" height="480" rx="12" fill="url(#indexGrad)" stroke="#f85149" stroke-width="2" filter="url(#shadow)"/>
+  <text x="80" y="1072" font-size="18" font-weight="700" fill="#ff7b72">Index 구조</text>
+  <text x="80" y="1096" font-size="12" fill="#8b949e">쿼리 시 불필요한 데이터를 pruning하여 I/O를 최소화</text>
+
+  <!-- Short Key -->
+  <rect x="80" y="1110" width="450" height="100" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="1.5"/>
+  <rect x="80" y="1110" width="450" height="24" rx="8" fill="#f0883e"/><rect x="80" y="1122" width="450" height="12" fill="#f0883e"/>
+  <text x="96" y="1127" font-size="13" font-weight="700" fill="#fff">Short Key Index</text><text x="310" y="1127" font-size="10" fill="#fff">short_key_index.h</text>
+  <text x="96" y="1152" font-size="11" fill="#ffa657">용도:</text><text x="135" y="1152" font-size="11" fill="#8b949e">키 컬럼 prefix로 범위 탐색 (B-tree 유사)</text>
+  <text x="96" y="1170" font-size="11" fill="#ffa657">구조:</text><text x="135" y="1170" font-size="11" fill="#8b949e">행 블록마다 첫 번째 키의 prefix 저장</text>
+  <text x="96" y="1188" font-size="11" fill="#ffa657">API:</text><text x="135" y="1188" font-size="11" fill="#79c0ff" font-family="monospace">lower_bound()</text><text x="260" y="1188" font-size="11" fill="#79c0ff" font-family="monospace">upper_bound()</text>
+
+  <!-- Ordinal -->
+  <rect x="560" y="1110" width="460" height="100" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="1.5"/>
+  <rect x="560" y="1110" width="460" height="24" rx="8" fill="#da3633"/><rect x="560" y="1122" width="460" height="12" fill="#da3633"/>
+  <text x="576" y="1127" font-size="13" font-weight="700" fill="#fff">Ordinal Index</text><text x="740" y="1127" font-size="10" fill="#fff">ordinal_page_index.h</text>
+  <text x="576" y="1152" font-size="11" fill="#ff7b72">용도:</text><text x="615" y="1152" font-size="11" fill="#8b949e">행 번호(ordinal) → 데이터 페이지 매핑</text>
+  <text x="576" y="1170" font-size="11" fill="#ff7b72">구조:</text><text x="615" y="1170" font-size="11" fill="#8b949e">_ordinals[i] = i번째 페이지 첫 행 번호</text>
+  <text x="576" y="1188" font-size="11" fill="#ff7b72">탐색:</text><text x="615" y="1188" font-size="11" fill="#8b949e">이진 탐색으로 특정 행의 페이지 위치 결정</text>
+
+  <!-- Zone Map -->
+  <rect x="80" y="1225" width="450" height="120" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="1.5"/>
+  <rect x="80" y="1225" width="450" height="24" rx="8" fill="#238636"/><rect x="80" y="1237" width="450" height="12" fill="#238636"/>
+  <text x="96" y="1242" font-size="13" font-weight="700" fill="#fff">Zone Map Index</text><text x="270" y="1242" font-size="10" fill="#fff">zone_map_index.h</text>
+  <text x="96" y="1267" font-size="11" fill="#7ee787">용도:</text><text x="135" y="1267" font-size="11" fill="#8b949e">페이지/세그먼트별 min/max 통계 → 범위 pruning</text>
+  <text x="96" y="1285" font-size="11" fill="#7ee787">구조:</text><text x="135" y="1285" font-size="11" fill="#8b949e">페이지별 {min, max, has_null}</text>
+  <text x="135" y="1303" font-size="11" fill="#8b949e">세그먼트 전체 글로벌 min/max</text>
+  <text x="96" y="1321" font-size="11" fill="#7ee787">효과:</text><text x="135" y="1321" font-size="11" fill="#8b949e">조건이 범위 밖이면 페이지/세그먼트 통째로 스킵</text>
+
+  <!-- Bitmap -->
+  <rect x="560" y="1225" width="460" height="120" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="1.5"/>
+  <rect x="560" y="1225" width="460" height="24" rx="8" fill="#8957e5"/><rect x="560" y="1237" width="460" height="12" fill="#8957e5"/>
+  <text x="576" y="1242" font-size="13" font-weight="700" fill="#fff">Bitmap Index</text><text x="720" y="1242" font-size="10" fill="#fff">bitmap_index_reader.h</text>
+  <text x="576" y="1267" font-size="11" fill="#d2a8ff">용도:</text><text x="615" y="1267" font-size="11" fill="#8b949e">등호(=) / IN 조건에서 빠른 필터링</text>
+  <text x="576" y="1285" font-size="11" fill="#d2a8ff">구조:</text><text x="615" y="1285" font-size="11" fill="#8b949e">딕셔너리(고유 값) + 값별 Roaring Bitmap</text>
+  <text x="576" y="1303" font-size="11" fill="#d2a8ff">추가:</text><text x="615" y="1303" font-size="11" fill="#8b949e">N-gram 지원 (substring 검색)</text>
+  <text x="615" y="1321" font-size="11" fill="#8b949e">NULL 전용 bitmap 별도 관리</text>
+
+  <!-- Bloom Filter -->
+  <rect x="240" y="1380" width="520" height="120" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="1.5"/>
+  <rect x="240" y="1380" width="520" height="24" rx="8" fill="#1f6feb"/><rect x="240" y="1392" width="520" height="12" fill="#1f6feb"/>
+  <text x="256" y="1397" font-size="13" font-weight="700" fill="#fff">Bloom Filter Index</text><text x="440" y="1397" font-size="10" fill="#fff">bloom_filter_index_reader.h</text>
+  <text x="256" y="1422" font-size="11" fill="#79c0ff">용도:</text><text x="295" y="1422" font-size="11" fill="#8b949e">"이 값이 이 블록에 존재하는가?" 확률적 빠른 체크</text>
+  <text x="256" y="1440" font-size="11" fill="#79c0ff">구조:</text><text x="295" y="1440" font-size="11" fill="#8b949e">블록 단위 Bloom Filter (BLOCK_BLOOM_FILTER)</text>
+  <text x="256" y="1458" font-size="11" fill="#79c0ff">해시:</text><text x="295" y="1458" font-size="11" fill="#8b949e">HASH_MURMUR3_X64_64</text>
+  <text x="256" y="1476" font-size="11" fill="#79c0ff">특성:</text><text x="295" y="1476" font-size="11" fill="#8b949e">False Positive 가능, False Negative 없음</text>
+</svg>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-color" style="background:#1f6feb"></div>Tablet</div>
+  <div class="legend-item"><div class="legend-color" style="background:#8957e5"></div>Rowset</div>
+  <div class="legend-item"><div class="legend-color" style="background:#238636"></div>Segment</div>
+  <div class="legend-item"><div class="legend-color" style="background:#d29922"></div>ColumnReader</div>
+  <div class="legend-item"><div class="legend-color" style="background:#f85149"></div>Index</div>
+</div>
+
+<hr class="divider"/>
+
+<!-- ================================================================== -->
+<!-- PART 2: PHYSICAL FILE STRUCTURE                                    -->
+<!-- ================================================================== -->
+
+<h2>Part 2 — 물리 파일 구조 (Physical File Layout)</h2>
+<p class="section-desc">디스크에 실제로 기록되는 바이트 수준 구조 — segment.proto / page_io.cpp 기반</p>
+
+<svg width="1100" height="2380" viewBox="0 0 1100 2380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#484f58"/></marker>
+    <marker id="arr2g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#238636"/></marker>
+    <marker id="arr2b" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#58a6ff"/></marker>
+    <marker id="arr2o" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#f0883e"/></marker>
+    <filter id="sh2"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.4"/></filter>
+  </defs>
+
+  <!-- ============================================================ -->
+  <!-- 2-1. DISK DIRECTORY LAYOUT                                   -->
+  <!-- ============================================================ -->
+  <rect x="30" y="10" width="1040" height="260" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1.5" filter="url(#sh2)"/>
+  <text x="50" y="38" font-size="16" font-weight="700" fill="#58a6ff">2-1. 디스크 디렉토리 레이아웃</text>
+  <text x="50" y="56" font-size="11" fill="#484f58">TabletMetaPB (olap_file.proto)  |  DataDir (data_dir.h)</text>
+
+  <!-- Tree -->
+  <text x="70" y="84" font-size="13" fill="#e3b341" font-family="monospace">data_dir/</text>
+  <text x="100" y="104" font-size="13" fill="#8b949e" font-family="monospace">├── tablet_meta.pb</text>
+  <text x="320" y="104" font-size="11" fill="#484f58">← TabletMetaPB: schema, rs_metas[], updates</text>
+  <text x="100" y="124" font-size="13" fill="#8b949e" font-family="monospace">├── {rowset_id}_0.dat</text>
+  <text x="320" y="124" font-size="11" fill="#484f58">← Rowset 0, Segment 0</text>
+  <text x="100" y="144" font-size="13" fill="#8b949e" font-family="monospace">├── {rowset_id}_1.dat</text>
+  <text x="320" y="144" font-size="11" fill="#484f58">← Rowset 0, Segment 1</text>
+  <text x="100" y="164" font-size="13" fill="#8b949e" font-family="monospace">├── {rowset_id2}_0.dat</text>
+  <text x="320" y="164" font-size="11" fill="#484f58">← Rowset 1, Segment 0</text>
+  <text x="100" y="184" font-size="13" fill="#8b949e" font-family="monospace">└── ...</text>
+
+  <!-- Naming box -->
+  <rect x="580" y="72" width="470" height="100" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="596" y="92" font-size="12" font-weight="600" fill="#c9d1d9">파일 네이밍 규칙</text>
+  <text x="596" y="114" font-size="11" fill="#ffa657">세그먼트:</text><text x="670" y="114" font-size="11" fill="#7ee787" font-family="monospace">{rowset_id}_{seg_id}.dat</text>
+  <text x="596" y="134" font-size="11" fill="#ffa657">메타:</text><text x="670" y="134" font-size="11" fill="#7ee787" font-family="monospace">tablet_meta.pb</text>
+  <text x="596" y="154" font-size="11" fill="#ffa657">PK 인덱스:</text><text x="670" y="154" font-size="11" fill="#7ee787" font-family="monospace">{rowset_id}_{seg_id}.cols</text>
+
+  <!-- Rowset → Segment mapping -->
+  <rect x="580" y="182" width="470" height="72" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="596" y="202" font-size="12" font-weight="600" fill="#c9d1d9">Rowset → Segment 매핑</text>
+  <text x="596" y="222" font-size="11" fill="#8b949e">RowsetMetaPB.num_segments = N</text>
+  <text x="596" y="240" font-size="11" fill="#8b949e">→ N개의 .dat 파일이 연속 segment_id로 생성</text>
+
+  <!-- ============================================================ -->
+  <!-- 2-2. SEGMENT FILE BYTE LAYOUT                                -->
+  <!-- ============================================================ -->
+  <rect x="30" y="290" width="1040" height="580" rx="10" fill="#0d1117" stroke="#238636" stroke-width="1.5" filter="url(#sh2)"/>
+  <text x="50" y="318" font-size="16" font-weight="700" fill="#7ee787">2-2. 세그먼트 파일 바이트 레이아웃</text>
+  <text x="50" y="336" font-size="11" fill="#484f58">segment_writer.cpp / segment.cpp  |  Magic: "D0R1" (0x44303152)</text>
+
+  <!-- Main file layout diagram -->
+  <rect x="70" y="356" width="400" height="494" rx="8" fill="#161b22" stroke="#238636" stroke-width="1.5"/>
+
+  <!-- Column 0 data pages -->
+  <rect x="86" y="370" width="368" height="44" rx="4" fill="#1a3a2e" stroke="#2ea043" stroke-width="1"/>
+  <text x="270" y="387" font-size="12" font-weight="600" fill="#7ee787" text-anchor="middle">Column 0 — Data Pages</text>
+  <text x="270" y="404" font-size="10" fill="#8b949e" text-anchor="middle">Page 0  |  Page 1  |  ...  |  Page N</text>
+
+  <!-- Column 0 index pages -->
+  <rect x="86" y="420" width="368" height="34" rx="4" fill="#1a2a3e" stroke="#1f6feb" stroke-width="1"/>
+  <text x="270" y="442" font-size="11" fill="#79c0ff" text-anchor="middle">Column 0 — Ordinal Index + Zone Map Pages</text>
+
+  <!-- Column 1 data pages -->
+  <rect x="86" y="462" width="368" height="44" rx="4" fill="#1a3a2e" stroke="#2ea043" stroke-width="1"/>
+  <text x="270" y="479" font-size="12" font-weight="600" fill="#7ee787" text-anchor="middle">Column 1 — Data Pages</text>
+  <text x="270" y="496" font-size="10" fill="#8b949e" text-anchor="middle">Page 0  |  Page 1  |  ...  |  Page M</text>
+
+  <!-- Column 1 index pages -->
+  <rect x="86" y="512" width="368" height="34" rx="4" fill="#1a2a3e" stroke="#1f6feb" stroke-width="1"/>
+  <text x="270" y="534" font-size="11" fill="#79c0ff" text-anchor="middle">Column 1 — Ordinal Index + Zone Map Pages</text>
+
+  <!-- dots -->
+  <text x="270" y="570" font-size="16" fill="#484f58" text-anchor="middle">. . .</text>
+
+  <!-- Column N data pages -->
+  <rect x="86" y="582" width="368" height="34" rx="4" fill="#1a3a2e" stroke="#2ea043" stroke-width="1"/>
+  <text x="270" y="604" font-size="11" fill="#7ee787" text-anchor="middle">Column N — Data Pages + Index Pages</text>
+
+  <!-- Bitmap / Bloom -->
+  <rect x="86" y="624" width="368" height="34" rx="4" fill="#2a1a3e" stroke="#8957e5" stroke-width="1"/>
+  <text x="270" y="646" font-size="11" fill="#d2a8ff" text-anchor="middle">Bitmap Index Pages  |  Bloom Filter Pages</text>
+
+  <!-- Short Key Index -->
+  <rect x="86" y="666" width="368" height="34" rx="4" fill="#3a2a1a" stroke="#f0883e" stroke-width="1"/>
+  <text x="270" y="688" font-size="11" fill="#ffa657" text-anchor="middle">Short Key Index Page</text>
+
+  <!-- Footer -->
+  <rect x="86" y="708" width="368" height="34" rx="4" fill="#1a1a2e" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="270" y="730" font-size="12" font-weight="600" fill="#58a6ff" text-anchor="middle">SegmentFooterPB (Protobuf 직렬화)</text>
+
+  <!-- Trailer -->
+  <rect x="86" y="750" width="120" height="30" rx="4" fill="#21262d" stroke="#f85149" stroke-width="1.5"/>
+  <text x="146" y="770" font-size="10" font-weight="600" fill="#ff7b72" text-anchor="middle">Footer Size</text>
+  <text x="146" y="783" font-size="9" fill="#484f58" text-anchor="middle">uint32 LE</text>
+
+  <rect x="210" y="750" width="120" height="30" rx="4" fill="#21262d" stroke="#f85149" stroke-width="1.5"/>
+  <text x="270" y="770" font-size="10" font-weight="600" fill="#ff7b72" text-anchor="middle">Checksum</text>
+  <text x="270" y="783" font-size="9" fill="#484f58" text-anchor="middle">CRC32C</text>
+
+  <rect x="334" y="750" width="120" height="30" rx="4" fill="#21262d" stroke="#f85149" stroke-width="1.5"/>
+  <text x="394" y="770" font-size="10" font-weight="600" fill="#ff7b72" text-anchor="middle">Magic "D0R1"</text>
+  <text x="394" y="783" font-size="9" fill="#484f58" text-anchor="middle">0x44303152</text>
+
+  <!-- Byte offset labels -->
+  <text x="60" y="378" font-size="9" fill="#484f58" text-anchor="end">0x0000</text>
+  <text x="60" y="720" font-size="9" fill="#484f58" text-anchor="end">offset Y</text>
+  <text x="60" y="768" font-size="9" fill="#484f58" text-anchor="end">Y + K</text>
+  <text x="60" y="790" font-size="9" fill="#484f58" text-anchor="end">EOF-12</text>
+
+  <!-- Right side: Footer details -->
+  <rect x="510" y="356" width="540" height="230" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="530" y="380" font-size="14" font-weight="700" fill="#58a6ff">SegmentFooterPB 구조</text>
+  <text x="530" y="398" font-size="10" fill="#484f58">gensrc/proto/segment.proto</text>
+
+  <text x="540" y="422" font-size="11" fill="#79c0ff" font-family="monospace">version</text><text x="680" y="422" font-size="11" fill="#8b949e">uint32 — 파일 포맷 버전</text>
+  <text x="540" y="442" font-size="11" fill="#79c0ff" font-family="monospace">num_rows</text><text x="680" y="442" font-size="11" fill="#8b949e">uint32 — 세그먼트 총 행 수</text>
+  <text x="540" y="462" font-size="11" fill="#79c0ff" font-family="monospace">columns[]</text><text x="680" y="462" font-size="11" fill="#8b949e">ColumnMetaPB 배열 (컬럼별 메타)</text>
+  <text x="540" y="482" font-size="11" fill="#79c0ff" font-family="monospace">short_key_index_page</text><text x="730" y="482" font-size="11" fill="#8b949e">PagePointerPB</text>
+  <text x="540" y="508" font-size="12" font-weight="600" fill="#e3b341">ColumnMetaPB 상세:</text>
+  <text x="556" y="528" font-size="11" fill="#e3b341" font-family="monospace">column_id, unique_id</text><text x="740" y="528" font-size="11" fill="#8b949e">컬럼 식별자</text>
+  <text x="556" y="546" font-size="11" fill="#e3b341" font-family="monospace">type</text><text x="740" y="546" font-size="11" fill="#8b949e">LogicalType 열거형</text>
+  <text x="556" y="564" font-size="11" fill="#e3b341" font-family="monospace">encoding</text><text x="740" y="564" font-size="11" fill="#8b949e">PLAIN/DICT/RLE/BIT_SHUFFLE/FOR</text>
+  <text x="556" y="582" font-size="11" fill="#e3b341" font-family="monospace">compression</text><text x="740" y="582" font-size="11" fill="#8b949e">LZ4_FRAME/SNAPPY/ZSTD/GZIP</text>
+
+  <!-- Right side: Read process -->
+  <rect x="510" y="600" width="540" height="140" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="1.5"/>
+  <text x="530" y="624" font-size="14" font-weight="700" fill="#ffa657">파일 읽기 절차 (Read Path)</text>
+  <text x="540" y="650" font-size="11" fill="#c9d1d9">1. 파일 끝에서 12바이트 읽기 → Magic 검증 ("D0R1")</text>
+  <text x="540" y="670" font-size="11" fill="#c9d1d9">2. Footer Size (4B) → SegmentFooterPB 역직렬화</text>
+  <text x="540" y="690" font-size="11" fill="#c9d1d9">3. CRC32C 체크섬 검증 (Footer 데이터 대상)</text>
+  <text x="540" y="710" font-size="11" fill="#c9d1d9">4. ColumnMetaPB → PagePointer로 필요 페이지만 I/O</text>
+  <text x="540" y="730" font-size="11" fill="#c9d1d9">5. Short Key Index → 키 기반 범위 탐색 시작</text>
+
+  <!-- Right side: PagePointer -->
+  <rect x="510" y="756" width="540" height="100" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="530" y="780" font-size="14" font-weight="700" fill="#c9d1d9">PagePointer (page_pointer.h)</text>
+  <text x="530" y="798" font-size="11" fill="#484f58">모든 인덱스/데이터 페이지의 위치 참조 단위</text>
+
+  <rect x="540" y="810" width="160" height="30" rx="4" fill="#1a3a2e" stroke="#30363d"/>
+  <text x="620" y="830" font-size="11" fill="#7ee787" text-anchor="middle" font-family="monospace">offset (uint64)</text>
+  <rect x="710" y="810" width="140" height="30" rx="4" fill="#1a3a2e" stroke="#30363d"/>
+  <text x="780" y="830" font-size="11" fill="#7ee787" text-anchor="middle" font-family="monospace">size (uint32)</text>
+  <text x="870" y="830" font-size="11" fill="#484f58">→ varint 인코딩</text>
+
+  <!-- ============================================================ -->
+  <!-- 2-3. PAGE INTERNAL FORMAT                                    -->
+  <!-- ============================================================ -->
+  <rect x="30" y="890" width="1040" height="520" rx="10" fill="#0d1117" stroke="#d29922" stroke-width="1.5" filter="url(#sh2)"/>
+  <text x="50" y="918" font-size="16" font-weight="700" fill="#e3b341">2-3. 페이지 내부 구조 (Page Format)</text>
+  <text x="50" y="936" font-size="11" fill="#484f58">page_io.cpp / parsed_page.h  |  모든 페이지 공통 포맷</text>
+
+  <!-- Generic page layout -->
+  <rect x="70" y="954" width="480" height="210" rx="8" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+  <text x="80" y="976" font-size="13" font-weight="700" fill="#e3b341">공통 페이지 바이트 레이아웃</text>
+
+  <rect x="86" y="990" width="448" height="46" rx="4" fill="#2a2a1a" stroke="#d29922" stroke-width="1"/>
+  <text x="310" y="1010" font-size="12" font-weight="600" fill="#e3b341" text-anchor="middle">Page Body (인코딩 + 압축된 데이터)</text>
+  <text x="310" y="1026" font-size="10" fill="#8b949e" text-anchor="middle">압축 시: body_size &lt; uncompressed_size</text>
+
+  <rect x="86" y="1044" width="448" height="34" rx="4" fill="#1a2a3e" stroke="#1f6feb" stroke-width="1"/>
+  <text x="310" y="1066" font-size="12" fill="#79c0ff" text-anchor="middle">PageFooterPB (Protobuf 직렬화)</text>
+
+  <rect x="86" y="1086" width="220" height="28" rx="4" fill="#21262d" stroke="#f85149"/>
+  <text x="196" y="1105" font-size="10" font-weight="600" fill="#ff7b72" text-anchor="middle">Footer Size (uint32 LE)</text>
+
+  <rect x="314" y="1086" width="220" height="28" rx="4" fill="#21262d" stroke="#f85149"/>
+  <text x="424" y="1105" font-size="10" font-weight="600" fill="#ff7b72" text-anchor="middle">Checksum CRC32C (uint32 LE)</text>
+
+  <text x="86" y="1148" font-size="11" fill="#ffa657">체크섬 범위:</text><text x="175" y="1148" font-size="11" fill="#8b949e">Body + FooterPB + Footer Size (체크섬 자체 제외)</text>
+
+  <!-- PageFooterPB details -->
+  <rect x="580" y="954" width="470" height="210" rx="8" fill="#161b22" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="600" y="978" font-size="13" font-weight="700" fill="#79c0ff">PageFooterPB 구조</text>
+
+  <text x="600" y="1002" font-size="12" font-weight="600" fill="#ffa657">공통 필드:</text>
+  <text x="616" y="1020" font-size="11" fill="#79c0ff" font-family="monospace">type</text><text x="720" y="1020" font-size="11" fill="#8b949e">DATA_PAGE / INDEX_PAGE /</text>
+  <text x="720" y="1036" font-size="11" fill="#8b949e">DICTIONARY_PAGE / SHORT_KEY_PAGE</text>
+  <text x="616" y="1056" font-size="11" fill="#79c0ff" font-family="monospace">uncompressed_size</text><text x="770" y="1056" font-size="11" fill="#8b949e">압축 전 크기</text>
+
+  <text x="600" y="1084" font-size="12" font-weight="600" fill="#ffa657">Data Page 전용:</text>
+  <text x="616" y="1102" font-size="11" fill="#79c0ff" font-family="monospace">first_ordinal</text><text x="770" y="1102" font-size="11" fill="#8b949e">첫 행 번호</text>
+  <text x="616" y="1120" font-size="11" fill="#79c0ff" font-family="monospace">num_values</text><text x="770" y="1120" font-size="11" fill="#8b949e">행 수 (NULL 포함)</text>
+  <text x="616" y="1138" font-size="11" fill="#79c0ff" font-family="monospace">nullmap_size</text><text x="770" y="1138" font-size="11" fill="#8b949e">NULL 비트맵 크기</text>
+  <text x="616" y="1156" font-size="11" fill="#79c0ff" font-family="monospace">null_encoding</text><text x="770" y="1156" font-size="11" fill="#8b949e">BITSHUFFLE / RLE / LZ4</text>
+
+  <!-- Data Page Body detail -->
+  <rect x="70" y="1180" width="480" height="210" rx="8" fill="#161b22" stroke="#2ea043" stroke-width="1.5"/>
+  <text x="90" y="1204" font-size="13" font-weight="700" fill="#7ee787">Data Page Body 내부 구조 (format v2)</text>
+
+  <rect x="86" y="1218" width="448" height="50" rx="4" fill="#1a3a2e" stroke="#2ea043"/>
+  <text x="310" y="1240" font-size="12" font-weight="600" fill="#7ee787" text-anchor="middle">Encoded Values</text>
+  <text x="310" y="1258" font-size="10" fill="#8b949e" text-anchor="middle">인코딩 방식에 따라 다른 바이너리 포맷</text>
+
+  <rect x="86" y="1276" width="448" height="36" rx="4" fill="#2a1a2a" stroke="#f85149"/>
+  <text x="310" y="1300" font-size="12" fill="#ff7b72" text-anchor="middle">Null Bitmap (BITSHUFFLE / RLE / LZ4 압축)</text>
+
+  <!-- Encoding label -->
+  <text x="90" y="1334" font-size="11" fill="#ffa657">Nullable 컬럼만:</text><text x="200" y="1334" font-size="11" fill="#8b949e">NULL 행 위치를 비트맵으로 기록, 3가지 압축 중 선택</text>
+  <text x="90" y="1354" font-size="11" fill="#ffa657">Non-null 컬럼:</text><text x="200" y="1354" font-size="11" fill="#8b949e">Encoded Values만 존재 (Null Bitmap 생략)</text>
+  <text x="90" y="1374" font-size="11" fill="#ffa657">Dict-encoded:</text><text x="200" y="1374" font-size="11" fill="#8b949e">별도 DICTIONARY_PAGE에 사전 저장, 값은 코드 배열</text>
+
+  <!-- Encoding types detail -->
+  <rect x="580" y="1180" width="470" height="210" rx="8" fill="#161b22" stroke="#e3b341" stroke-width="1.5"/>
+  <text x="600" y="1204" font-size="13" font-weight="700" fill="#e3b341">인코딩 타입 (EncodingTypePB)</text>
+  <text x="600" y="1222" font-size="10" fill="#484f58">encoding_info.h / segment.proto</text>
+
+  <text x="616" y="1246" font-size="11" fill="#e3b341" font-family="monospace">PLAIN (2)</text><text x="750" y="1246" font-size="11" fill="#8b949e">원본 그대로, 문자열 기본</text>
+  <text x="616" y="1266" font-size="11" fill="#e3b341" font-family="monospace">PREFIX (3)</text><text x="750" y="1266" font-size="11" fill="#8b949e">앞 키와의 공통 prefix 제거</text>
+  <text x="616" y="1286" font-size="11" fill="#e3b341" font-family="monospace">RLE (4)</text><text x="750" y="1286" font-size="11" fill="#8b949e">연속 같은 값 → (값, 횟수)</text>
+  <text x="616" y="1306" font-size="11" fill="#e3b341" font-family="monospace">DICT (5)</text><text x="750" y="1306" font-size="11" fill="#8b949e">사전 + 코드 배열</text>
+  <text x="616" y="1326" font-size="11" fill="#e3b341" font-family="monospace">BIT_SHUFFLE (6)</text><text x="750" y="1326" font-size="11" fill="#8b949e">비트 재배치 후 LZ4, 숫자 기본</text>
+  <text x="616" y="1346" font-size="11" fill="#e3b341" font-family="monospace">FOR (7)</text><text x="750" y="1346" font-size="11" fill="#8b949e">Frame-of-Reference, 델타 인코딩</text>
+
+  <text x="600" y="1374" font-size="11" font-weight="600" fill="#d2a8ff">압축 (CompressionTypePB):</text>
+  <text x="616" y="1388" font-size="11" fill="#d2a8ff" font-family="monospace">LZ4_FRAME</text><text x="730" y="1388" font-size="10" fill="#8b949e">(기본)</text>
+  <text x="790" y="1388" font-size="11" fill="#d2a8ff" font-family="monospace">SNAPPY</text>
+  <text x="860" y="1388" font-size="11" fill="#d2a8ff" font-family="monospace">ZSTD</text>
+  <text x="910" y="1388" font-size="11" fill="#d2a8ff" font-family="monospace">GZIP</text>
+
+  <!-- ============================================================ -->
+  <!-- 2-4. INDEX PAGE STRUCTURES                                   -->
+  <!-- ============================================================ -->
+  <rect x="30" y="1430" width="1040" height="530" rx="10" fill="#0d1117" stroke="#f85149" stroke-width="1.5" filter="url(#sh2)"/>
+  <text x="50" y="1458" font-size="16" font-weight="700" fill="#ff7b72">2-4. 인덱스 페이지 물리 구조</text>
+  <text x="50" y="1476" font-size="11" fill="#484f58">각 인덱스가 파일 내에 저장되는 바이트 구조</text>
+
+  <!-- Short Key Index physical -->
+  <rect x="70" y="1494" width="480" height="200" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="1.5"/>
+  <text x="90" y="1518" font-size="13" font-weight="700" fill="#ffa657">Short Key Index Page</text>
+  <text x="300" y="1518" font-size="10" fill="#484f58">ShortKeyFooterPB</text>
+
+  <rect x="86" y="1532" width="448" height="36" rx="4" fill="#3a2a1a" stroke="#f0883e"/>
+  <text x="310" y="1556" font-size="11" fill="#ffa657" text-anchor="middle">Key Content (raw binary keys — prefix 인코딩된 키 바이트)</text>
+
+  <rect x="86" y="1576" width="448" height="30" rx="4" fill="#2a2a1a" stroke="#f0883e"/>
+  <text x="310" y="1596" font-size="11" fill="#ffa657" text-anchor="middle">Offset Array (varint32 per key → 각 키 시작 위치)</text>
+
+  <text x="90" y="1630" font-size="11" fill="#ffa657">키 마커:</text>
+  <rect x="160" y="1618" width="50" height="18" rx="3" fill="#f0883e"/><text x="185" y="1631" font-size="9" fill="#fff" text-anchor="middle">0x00</text>
+  <text x="218" y="1631" font-size="10" fill="#8b949e">MIN</text>
+  <rect x="250" y="1618" width="50" height="18" rx="3" fill="#f0883e"/><text x="275" y="1631" font-size="9" fill="#fff" text-anchor="middle">0x01</text>
+  <text x="308" y="1631" font-size="10" fill="#8b949e">NULL↑</text>
+  <rect x="350" y="1618" width="50" height="18" rx="3" fill="#238636"/><text x="375" y="1631" font-size="9" fill="#fff" text-anchor="middle">0x02</text>
+  <text x="408" y="1631" font-size="10" fill="#8b949e">NORMAL</text>
+  <rect x="458" y="1618" width="50" height="18" rx="3" fill="#f0883e"/><text x="483" y="1631" font-size="9" fill="#fff" text-anchor="middle">0xFF</text>
+  <text x="516" y="1631" font-size="10" fill="#8b949e">MAX</text>
+
+  <text x="90" y="1664" font-size="11" fill="#8b949e">num_rows_per_block 행마다 Short Key 엔트리 1개 생성</text>
+  <text x="90" y="1682" font-size="11" fill="#8b949e">SegmentFooterPB.short_key_index_page → PagePointer로 참조</text>
+
+  <!-- Ordinal / B-Tree Index physical -->
+  <rect x="580" y="1494" width="470" height="200" rx="8" fill="#161b22" stroke="#da3633" stroke-width="1.5"/>
+  <text x="600" y="1518" font-size="13" font-weight="700" fill="#ff7b72">Ordinal Index (B-Tree Page)</text>
+  <text x="810" y="1518" font-size="10" fill="#484f58">BTreeMetaPB</text>
+
+  <rect x="596" y="1532" width="438" height="56" rx="4" fill="#2a1a1a" stroke="#da3633"/>
+  <text x="815" y="1550" font-size="11" fill="#ff7b72" text-anchor="middle">IndexEntry × N개 반복:</text>
+  <text x="815" y="1570" font-size="10" fill="#8b949e" text-anchor="middle">[Key Len (varint32)] [Key Data] [Page Offset (varint64)] [Page Size (varint32)]</text>
+  <text x="815" y="1584" font-size="9" fill="#484f58" text-anchor="middle">Key = 해당 데이터 페이지의 first_ordinal</text>
+
+  <text x="600" y="1612" font-size="11" fill="#ff7b72">B-Tree 구조:</text>
+  <text x="616" y="1632" font-size="11" fill="#8b949e">- Root Page → Internal Pages → Leaf Pages → Data Pages</text>
+  <text x="616" y="1652" font-size="11" fill="#8b949e">- 데이터 페이지 1개뿐이면 root = data page (is_root_data_page)</text>
+  <text x="616" y="1672" font-size="11" fill="#8b949e">- 이진 탐색으로 ordinal → page offset 결정</text>
+  <text x="600" y="1692" font-size="11" fill="#484f58">IndexPageFooterPB.type: LEAF(1) | INTERNAL(2)</text>
+
+  <!-- Zone Map physical -->
+  <rect x="70" y="1710" width="480" height="130" rx="8" fill="#161b22" stroke="#238636" stroke-width="1.5"/>
+  <text x="90" y="1734" font-size="13" font-weight="700" fill="#7ee787">Zone Map Index</text>
+  <text x="280" y="1734" font-size="10" fill="#484f58">ZoneMapPB / IndexedColumnMetaPB</text>
+
+  <text x="90" y="1758" font-size="11" fill="#7ee787">세그먼트 레벨:</text><text x="200" y="1758" font-size="11" fill="#8b949e">ColumnMetaPB 안에 직접 포함 (1개)</text>
+  <text x="90" y="1778" font-size="11" fill="#7ee787">페이지 레벨:</text><text x="200" y="1778" font-size="11" fill="#8b949e">IndexedColumn으로 별도 페이지에 저장 (N개)</text>
+  <text x="90" y="1806" font-size="11" fill="#c9d1d9" font-family="monospace">ZoneMapPB {</text>
+  <text x="110" y="1822" font-size="11" fill="#7ee787" font-family="monospace">  min, max</text><text x="250" y="1822" font-size="11" fill="#8b949e">bytes — 인코딩된 min/max 값</text>
+  <text x="110" y="1838" font-size="11" fill="#7ee787" font-family="monospace">  has_null, has_not_null</text><text x="320" y="1838" font-size="11" fill="#8b949e">bool 플래그</text>
+
+  <!-- Bitmap / Bloom physical -->
+  <rect x="580" y="1710" width="470" height="130" rx="8" fill="#161b22" stroke="#8957e5" stroke-width="1.5"/>
+  <text x="600" y="1734" font-size="13" font-weight="700" fill="#d2a8ff">Bitmap Index / Bloom Filter</text>
+  <text x="830" y="1734" font-size="10" fill="#484f58">물리 저장 구조</text>
+
+  <text x="616" y="1758" font-size="12" font-weight="600" fill="#d2a8ff">Bitmap Index:</text>
+  <text x="616" y="1778" font-size="11" fill="#8b949e">IndexedColumn × 2 (dict_column + bitmap_column)</text>
+  <text x="616" y="1796" font-size="11" fill="#8b949e">dict: 고유 값 정렬 배열 / bitmap: Roaring Bitmap</text>
+
+  <text x="616" y="1822" font-size="12" font-weight="600" fill="#d2a8ff">Bloom Filter:</text>
+  <text x="616" y="1838" font-size="11" fill="#8b949e">IndexedColumn × 1 (페이지별 블룸 필터 바이트 배열)</text>
+
+  <!-- ============================================================ -->
+  <!-- 2-5. BINARY PLAIN PAGE (String)                              -->
+  <!-- ============================================================ -->
+  <rect x="30" y="1980" width="1040" height="190" rx="10" fill="#0d1117" stroke="#d2a8ff" stroke-width="1.5" filter="url(#sh2)"/>
+  <text x="50" y="2008" font-size="16" font-weight="700" fill="#d2a8ff">2-5. Binary Plain Page (문자열 인코딩)</text>
+  <text x="50" y="2026" font-size="11" fill="#484f58">binary_plain_page.h — PLAIN_ENCODING 시 문자열 저장 방식</text>
+
+  <rect x="70" y="2042" width="700" height="110" rx="8" fill="#161b22" stroke="#d2a8ff" stroke-width="1.5"/>
+
+  <rect x="86" y="2058" width="350" height="34" rx="4" fill="#2a1f4e" stroke="#8957e5"/>
+  <text x="261" y="2080" font-size="12" fill="#d2a8ff" text-anchor="middle">Raw String Data (연속 바이트)</text>
+
+  <rect x="444" y="2058" width="200" height="34" rx="4" fill="#1a2a3e" stroke="#1f6feb"/>
+  <text x="544" y="2080" font-size="12" fill="#79c0ff" text-anchor="middle">Offset Array (uint32 × N)</text>
+
+  <rect x="652" y="2058" width="100" height="34" rx="4" fill="#21262d" stroke="#f85149"/>
+  <text x="702" y="2080" font-size="11" fill="#ff7b72" text-anchor="middle">Count (u32)</text>
+
+  <text x="90" y="2118" font-size="11" fill="#d2a8ff">읽기:</text><text x="130" y="2118" font-size="11" fill="#8b949e">offset[i] ~ offset[i+1] 사이가 i번째 문자열</text>
+  <text x="90" y="2138" font-size="11" fill="#d2a8ff">장점:</text><text x="130" y="2138" font-size="11" fill="#8b949e">가변 길이 문자열을 O(1) 랜덤 액세스</text>
+
+  <!-- ============================================================ -->
+  <!-- 2-6. WRITE/READ PATH FLOW                                    -->
+  <!-- ============================================================ -->
+  <rect x="30" y="2190" width="1040" height="170" rx="10" fill="#0d1117" stroke="#58a6ff" stroke-width="1.5" filter="url(#sh2)"/>
+  <text x="50" y="2218" font-size="16" font-weight="700" fill="#58a6ff">2-6. Write / Read 데이터 흐름</text>
+
+  <!-- Write path -->
+  <text x="50" y="2244" font-size="12" font-weight="600" fill="#7ee787">Write Path (segment_writer.cpp → column_writer.cpp → page_io.cpp)</text>
+  <rect x="70" y="2254" width="100" height="24" rx="4" fill="#1a3a2e" stroke="#2ea043"/>
+  <text x="120" y="2270" font-size="10" fill="#7ee787" text-anchor="middle">Raw Values</text>
+  <text x="178" y="2270" font-size="11" fill="#484f58">→</text>
+  <rect x="190" y="2254" width="80" height="24" rx="4" fill="#2a2a1a" stroke="#d29922"/>
+  <text x="230" y="2270" font-size="10" fill="#e3b341" text-anchor="middle">Encode</text>
+  <text x="278" y="2270" font-size="11" fill="#484f58">→</text>
+  <rect x="290" y="2254" width="100" height="24" rx="4" fill="#2a1a3e" stroke="#8957e5"/>
+  <text x="340" y="2270" font-size="10" fill="#d2a8ff" text-anchor="middle">Compress</text>
+  <text x="398" y="2270" font-size="11" fill="#484f58">→</text>
+  <rect x="410" y="2254" width="110" height="24" rx="4" fill="#1a2a3e" stroke="#1f6feb"/>
+  <text x="465" y="2270" font-size="10" fill="#79c0ff" text-anchor="middle">PageFooterPB</text>
+  <text x="528" y="2270" font-size="11" fill="#484f58">→</text>
+  <rect x="540" y="2254" width="110" height="24" rx="4" fill="#21262d" stroke="#f85149"/>
+  <text x="595" y="2270" font-size="10" fill="#ff7b72" text-anchor="middle">CRC32C + Write</text>
+  <text x="658" y="2270" font-size="11" fill="#484f58">→</text>
+  <rect x="670" y="2254" width="90" height="24" rx="4" fill="#161b22" stroke="#238636"/>
+  <text x="715" y="2270" font-size="10" fill="#7ee787" text-anchor="middle">.dat File</text>
+
+  <text x="80" y="2296" font-size="10" fill="#8b949e">압축 판단: space_saving = 1.0 - (compressed / uncompressed)  ≥ min_saving(0.1) 이면 압축 적용, 아니면 원본 저장</text>
+
+  <!-- Read path -->
+  <text x="50" y="2318" font-size="12" font-weight="600" fill="#79c0ff">Read Path (page_io.cpp → column_reader.cpp → segment.cpp)</text>
+  <rect x="70" y="2328" width="110" height="24" rx="4" fill="#161b22" stroke="#238636"/>
+  <text x="125" y="2344" font-size="10" fill="#7ee787" text-anchor="middle">PagePointer</text>
+  <text x="188" y="2344" font-size="11" fill="#484f58">→</text>
+  <rect x="200" y="2328" width="90" height="24" rx="4" fill="#21262d" stroke="#f85149"/>
+  <text x="245" y="2344" font-size="10" fill="#ff7b72" text-anchor="middle">Read + CRC</text>
+  <text x="298" y="2344" font-size="11" fill="#484f58">→</text>
+  <rect x="310" y="2328" width="110" height="24" rx="4" fill="#1a2a3e" stroke="#1f6feb"/>
+  <text x="365" y="2344" font-size="10" fill="#79c0ff" text-anchor="middle">Parse Footer</text>
+  <text x="428" y="2344" font-size="11" fill="#484f58">→</text>
+  <rect x="440" y="2328" width="110" height="24" rx="4" fill="#2a1a3e" stroke="#8957e5"/>
+  <text x="495" y="2344" font-size="10" fill="#d2a8ff" text-anchor="middle">Decompress</text>
+  <text x="558" y="2344" font-size="11" fill="#484f58">→</text>
+  <rect x="570" y="2328" width="100" height="24" rx="4" fill="#2a2a1a" stroke="#d29922"/>
+  <text x="620" y="2344" font-size="10" fill="#e3b341" text-anchor="middle">Decode</text>
+  <text x="678" y="2344" font-size="11" fill="#484f58">→</text>
+  <rect x="690" y="2328" width="100" height="24" rx="4" fill="#1a3a2e" stroke="#2ea043"/>
+  <text x="740" y="2344" font-size="10" fill="#7ee787" text-anchor="middle">Column Data</text>
+
+</svg>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-color" style="background:#238636"></div>Data / Segment</div>
+  <div class="legend-item"><div class="legend-color" style="background:#1f6feb"></div>Footer / Metadata</div>
+  <div class="legend-item"><div class="legend-color" style="background:#d29922"></div>Encoding</div>
+  <div class="legend-item"><div class="legend-color" style="background:#8957e5"></div>Compression / Bitmap</div>
+  <div class="legend-item"><div class="legend-color" style="background:#f85149"></div>Checksum / Trailer</div>
+  <div class="legend-item"><div class="legend-color" style="background:#f0883e"></div>Short Key / Markers</div>
+</div>
+
+<hr class="divider"/>
+
+<!-- ================================================================== -->
+<!-- PART 3: DATA INGESTION                                             -->
+<!-- ================================================================== -->
+
+<h2>Part 3 — Data Ingestion (쓰기 흐름)</h2>
+<p class="section-desc">FE RPC → LoadChannel → DeltaWriter → MemTable → SegmentWriter → Publish</p>
+
+<svg width="1100" height="1140" viewBox="0 0 1100 1140" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="a3" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#484f58"/></marker>
+    <marker id="a3g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#238636"/></marker>
+    <filter id="s3"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.4"/></filter>
+  </defs>
+
+  <!-- 3-1. PIPELINE -->
+  <rect x="30" y="10" width="1040" height="610" rx="10" fill="#0d1117" stroke="#238636" stroke-width="1.5" filter="url(#s3)"/>
+  <text x="50" y="38" font-size="16" font-weight="700" fill="#7ee787">3-1. Ingestion Pipeline</text>
+
+  <!-- Pipeline boxes -->
+  <rect x="70" y="56" width="200" height="56" rx="8" fill="#161b22" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="170" y="78" font-size="13" font-weight="700" fill="#58a6ff" text-anchor="middle">LoadChannel</text>
+  <text x="170" y="96" font-size="10" fill="#8b949e" text-anchor="middle">runtime/load_channel.h</text>
+  <text x="290" y="78" font-size="11" fill="#484f58">FE RPC 진입점. Chunk 역직렬화, 메모리 트래커</text>
+
+  <line x1="170" y1="112" x2="170" y2="130" stroke="#484f58" stroke-width="1.5" marker-end="url(#a3)"/>
+
+  <rect x="70" y="130" width="200" height="56" rx="8" fill="#161b22" stroke="#8957e5" stroke-width="1.5"/>
+  <text x="170" y="152" font-size="13" font-weight="700" fill="#d2a8ff" text-anchor="middle">TabletsChannel</text>
+  <text x="170" y="170" font-size="10" fill="#8b949e" text-anchor="middle">runtime/tablets_channel.h</text>
+  <text x="290" y="152" font-size="11" fill="#484f58">tablet별 DeltaWriter 생성/라우팅</text>
+
+  <line x1="170" y1="186" x2="170" y2="204" stroke="#484f58" stroke-width="1.5" marker-end="url(#a3)"/>
+
+  <rect x="70" y="204" width="200" height="56" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="1.5"/>
+  <text x="170" y="226" font-size="13" font-weight="700" fill="#ffa657" text-anchor="middle">DeltaWriter</text>
+  <text x="170" y="244" font-size="10" fill="#8b949e" text-anchor="middle">storage/delta_writer.h</text>
+  <text x="290" y="226" font-size="11" fill="#484f58">한 tablet 쓰기 조율. write(chunk) → MemTable</text>
+
+  <line x1="170" y1="260" x2="170" y2="278" stroke="#484f58" stroke-width="1.5" marker-end="url(#a3)"/>
+
+  <rect x="70" y="278" width="200" height="56" rx="8" fill="#161b22" stroke="#da3633" stroke-width="1.5"/>
+  <text x="170" y="300" font-size="13" font-weight="700" fill="#ff7b72" text-anchor="middle">MemTable</text>
+  <text x="170" y="318" font-size="10" fill="#8b949e" text-anchor="middle">storage/memtable.h</text>
+  <text x="290" y="293" font-size="11" fill="#484f58">메모리 버퍼링 → 정렬 → 집계</text>
+  <text x="290" y="311" font-size="11" fill="#484f58">flush 트리거: 메모리 초과 / 행 수 초과 / EOS</text>
+
+  <line x1="170" y1="334" x2="170" y2="352" stroke="#484f58" stroke-width="1.5" marker-end="url(#a3)"/>
+
+  <rect x="70" y="352" width="200" height="56" rx="8" fill="#161b22" stroke="#238636" stroke-width="1.5"/>
+  <text x="170" y="374" font-size="13" font-weight="700" fill="#7ee787" text-anchor="middle">SegmentWriter</text>
+  <text x="170" y="392" font-size="10" fill="#8b949e" text-anchor="middle">storage/rowset/segment_writer.h</text>
+  <text x="290" y="374" font-size="11" fill="#484f58">컬럼별 페이지 생성 + 인덱스 + Footer</text>
+
+  <line x1="170" y1="408" x2="170" y2="426" stroke="#484f58" stroke-width="1.5" marker-end="url(#a3)"/>
+
+  <rect x="70" y="426" width="200" height="46" rx="8" fill="#1a3a2e" stroke="#238636" stroke-width="2"/>
+  <text x="170" y="454" font-size="13" font-weight="700" fill="#7ee787" text-anchor="middle">.dat Segment File</text>
+
+  <line x1="170" y1="472" x2="170" y2="490" stroke="#484f58" stroke-width="1.5" marker-end="url(#a3)"/>
+
+  <rect x="70" y="490" width="200" height="46" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="2"/>
+  <text x="170" y="518" font-size="13" font-weight="700" fill="#58a6ff" text-anchor="middle">Publish Version</text>
+
+  <!-- DeltaWriter states -->
+  <rect x="580" y="56" width="470" height="100" rx="8" fill="#161b22" stroke="#f0883e" stroke-width="1.5"/>
+  <text x="600" y="80" font-size="13" font-weight="700" fill="#ffa657">DeltaWriter 상태 전이</text>
+  <rect x="610" y="94" width="100" height="20" rx="4" fill="#484f58"/><text x="660" y="108" font-size="10" fill="#fff" text-anchor="middle">Uninitialized</text>
+  <text x="716" y="108" font-size="11" fill="#484f58">→</text>
+  <rect x="726" y="94" width="70" height="20" rx="4" fill="#238636"/><text x="761" y="108" font-size="10" fill="#fff" text-anchor="middle">Writing</text>
+  <text x="802" y="108" font-size="11" fill="#484f58">→</text>
+  <rect x="812" y="94" width="60" height="20" rx="4" fill="#1f6feb"/><text x="842" y="108" font-size="10" fill="#fff" text-anchor="middle">Closed</text>
+  <text x="878" y="108" font-size="11" fill="#484f58">→</text>
+  <rect x="888" y="94" width="80" height="20" rx="4" fill="#6e40c9"/><text x="928" y="108" font-size="10" fill="#fff" text-anchor="middle">Committed</text>
+  <rect x="726" y="124" width="70" height="20" rx="4" fill="#da3633"/><text x="761" y="138" font-size="10" fill="#fff" text-anchor="middle">Aborted</text>
+  <text x="710" y="138" font-size="11" fill="#484f58">↓ error</text>
+
+  <!-- MemTable detail -->
+  <rect x="580" y="172" width="470" height="180" rx="8" fill="#161b22" stroke="#da3633" stroke-width="1.5"/>
+  <text x="600" y="196" font-size="13" font-weight="700" fill="#ff7b72">MemTable 상세</text>
+
+  <text x="600" y="220" font-size="11" fill="#ffa657">핵심 멤버:</text>
+  <text x="616" y="238" font-size="11" fill="#ff7b72" font-family="monospace">_chunk</text><text x="730" y="238" font-size="11" fill="#8b949e">버퍼링 중인 Chunk</text>
+  <text x="616" y="256" font-size="11" fill="#ff7b72" font-family="monospace">_max_buffer_size</text><text x="770" y="256" font-size="11" fill="#8b949e">config: write_buffer_size</text>
+  <text x="616" y="274" font-size="11" fill="#ff7b72" font-family="monospace">_aggregator</text><text x="730" y="274" font-size="11" fill="#8b949e">중복 키 집계</text>
+
+  <text x="600" y="298" font-size="11" fill="#ffa657">flush 전 처리:</text>
+  <text x="616" y="316" font-size="11" fill="#8b949e">1. Merge → 2. Sort → 3. Aggregate → 4. Split (PK: upsert/delete)</text>
+  <text x="600" y="340" font-size="11" fill="#ffa657">비동기 flush:</text>
+  <text x="700" y="340" font-size="11" fill="#8b949e">FlushToken → MemtableFlushTask (thread pool)</text>
+
+  <!-- Publish detail -->
+  <rect x="580" y="368" width="470" height="240" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="600" y="392" font-size="13" font-weight="700" fill="#58a6ff">Publish / Commit (버전 발행)</text>
+
+  <text x="600" y="418" font-size="12" font-weight="600" fill="#7ee787">Lake (Cloud-Native):</text>
+  <text x="616" y="436" font-size="11" fill="#8b949e">1. DeltaWriter.finish_with_txnlog() → TxnLogPB 생성</text>
+  <text x="616" y="454" font-size="11" fill="#8b949e">2. FE가 전체 replica에 publish 조율</text>
+  <text x="616" y="472" font-size="11" fill="#8b949e">3. publish_version() → metadata v(N+1) 생성</text>
+  <text x="616" y="490" font-size="11" fill="#8b949e">4. Object Storage에 기록 → 데이터 가시화</text>
+
+  <text x="600" y="518" font-size="12" font-weight="600" fill="#79c0ff">Non-Lake (Shared-Nothing):</text>
+  <text x="616" y="536" font-size="11" fill="#8b949e">1. DeltaWriter.commit() → RowsetWriter.build()</text>
+  <text x="616" y="554" font-size="11" fill="#8b949e">2. tablet->add_rowset() → _rs_version_map에 추가</text>
+  <text x="616" y="572" font-size="11" fill="#8b949e">3. VersionGraph 업데이트 → TxnManager 커밋</text>
+  <text x="616" y="590" font-size="11" fill="#8b949e">4. 데이터 가시화</text>
+
+  <!-- Memory management -->
+  <rect x="70" y="548" width="470" height="56" rx="8" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+  <text x="90" y="570" font-size="12" font-weight="700" fill="#e3b341">메모리 트래커 계층</text>
+  <rect x="100" y="578" width="86" height="18" rx="3" fill="#1f6feb"/><text x="143" y="591" font-size="9" fill="#fff" text-anchor="middle">LoadChannel</text>
+  <text x="192" y="591" font-size="10" fill="#484f58">→</text>
+  <rect x="200" y="578" width="96" height="18" rx="3" fill="#8957e5"/><text x="248" y="591" font-size="9" fill="#fff" text-anchor="middle">TabletsChannel</text>
+  <text x="302" y="591" font-size="10" fill="#484f58">→</text>
+  <rect x="310" y="578" width="86" height="18" rx="3" fill="#f0883e"/><text x="353" y="591" font-size="9" fill="#fff" text-anchor="middle">DeltaWriter</text>
+  <text x="402" y="591" font-size="10" fill="#484f58">→</text>
+  <rect x="410" y="578" width="70" height="18" rx="3" fill="#da3633"/><text x="445" y="591" font-size="9" fill="#fff" text-anchor="middle">MemTable</text>
+
+  <!-- SegmentWriter detail flow -->
+  <rect x="580" y="620" width="470" height="140" rx="8" fill="#161b22" stroke="#238636" stroke-width="1.5"/>
+  <text x="600" y="644" font-size="13" font-weight="700" fill="#7ee787">SegmentWriter 내부 흐름</text>
+
+  <rect x="610" y="658" width="120" height="24" rx="4" fill="#1a3a2e" stroke="#2ea043"/>
+  <text x="670" y="674" font-size="10" fill="#7ee787" text-anchor="middle">init(columns)</text>
+  <text x="736" y="674" font-size="10" fill="#484f58">→</text>
+  <rect x="746" y="658" width="120" height="24" rx="4" fill="#1a3a2e" stroke="#2ea043"/>
+  <text x="806" y="674" font-size="10" fill="#7ee787" text-anchor="middle">append_chunk()</text>
+  <text x="872" y="674" font-size="10" fill="#484f58">→</text>
+  <rect x="882" y="658" width="140" height="24" rx="4" fill="#1a3a2e" stroke="#2ea043"/>
+  <text x="952" y="674" font-size="10" fill="#7ee787" text-anchor="middle">finalize_columns()</text>
+
+  <text x="952" y="700" font-size="10" fill="#484f58">↓</text>
+  <rect x="882" y="708" width="140" height="24" rx="4" fill="#1a2a3e" stroke="#1f6feb"/>
+  <text x="952" y="724" font-size="10" fill="#79c0ff" text-anchor="middle">finalize_footer()</text>
+
+  <text x="616" y="710" font-size="11" fill="#8b949e">각 컬럼별 writer가 페이지 생성</text>
+  <text x="616" y="728" font-size="11" fill="#8b949e">Short Key + Zone Map + Bloom 인덱스 동시 생성</text>
+  <text x="616" y="746" font-size="11" fill="#8b949e">SegmentFooterPB + Magic "D0R1" 기록</text>
+
+  <!-- Spill note -->
+  <rect x="70" y="620" width="470" height="56" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="90" y="642" font-size="12" font-weight="600" fill="#c9d1d9">Spill 지원 (대용량 load)</text>
+  <text x="90" y="660" font-size="11" fill="#8b949e">메모리 초과 시 LoadSpillBlockManager로 디스크에 spill → 나중에 merge</text>
+</svg>
+
+<hr class="divider"/>
+
+<!-- ================================================================== -->
+<!-- PART 4: DATA READ                                                  -->
+<!-- ================================================================== -->
+
+<h2>Part 4 — Data Read (읽기 흐름)</h2>
+<p class="section-desc">MVCC 스냅샷 캡처 → 인덱스 pruning → 컬럼 읽기 → Iterator 병합</p>
+
+<svg width="1100" height="1180" viewBox="0 0 1100 1180" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="a4" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#484f58"/></marker>
+    <filter id="s4"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.4"/></filter>
+  </defs>
+
+  <!-- 4-1. SCAN PIPELINE -->
+  <rect x="30" y="10" width="1040" height="400" rx="10" fill="#0d1117" stroke="#79c0ff" stroke-width="1.5" filter="url(#s4)"/>
+  <text x="50" y="38" font-size="16" font-weight="700" fill="#79c0ff">4-1. Scan Pipeline</text>
+
+  <!-- Pipeline -->
+  <rect x="70" y="56" width="210" height="50" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="175" y="76" font-size="13" font-weight="700" fill="#58a6ff" text-anchor="middle">TabletReader</text>
+  <text x="175" y="94" font-size="10" fill="#8b949e" text-anchor="middle">storage/tablet_reader.h</text>
+
+  <text x="300" y="70" font-size="11" fill="#7ee787">prepare()</text>
+  <text x="370" y="70" font-size="11" fill="#484f58">→ capture_consistent_rowsets(version)</text>
+  <text x="300" y="88" font-size="11" fill="#79c0ff">open(params)</text>
+  <text x="398" y="88" font-size="11" fill="#484f58">→ 이터레이터 스택 구성</text>
+
+  <line x1="175" y1="106" x2="175" y2="126" stroke="#484f58" stroke-width="1.5" marker-end="url(#a4)"/>
+
+  <rect x="70" y="126" width="210" height="50" rx="8" fill="#161b22" stroke="#d2a8ff" stroke-width="1.5"/>
+  <text x="175" y="146" font-size="13" font-weight="700" fill="#d2a8ff" text-anchor="middle">Merge/Union Iterator</text>
+  <text x="175" y="164" font-size="10" fill="#8b949e" text-anchor="middle">keys_type별 전략</text>
+
+  <line x1="175" y1="176" x2="175" y2="196" stroke="#484f58" stroke-width="1.5" marker-end="url(#a4)"/>
+
+  <rect x="70" y="196" width="210" height="50" rx="8" fill="#161b22" stroke="#238636" stroke-width="1.5"/>
+  <text x="175" y="216" font-size="13" font-weight="700" fill="#7ee787" text-anchor="middle">SegmentIterator</text>
+  <text x="175" y="234" font-size="10" fill="#8b949e" text-anchor="middle">segment_iterator.cpp</text>
+
+  <line x1="175" y1="246" x2="175" y2="266" stroke="#484f58" stroke-width="1.5" marker-end="url(#a4)"/>
+
+  <rect x="70" y="266" width="210" height="36" rx="8" fill="#1a3a2e" stroke="#238636" stroke-width="2"/>
+  <text x="175" y="290" font-size="12" font-weight="600" fill="#7ee787" text-anchor="middle">Chunk 반환 (max 4096행)</text>
+
+  <!-- Iterator strategy table -->
+  <rect x="580" y="56" width="470" height="200" rx="8" fill="#161b22" stroke="#d2a8ff" stroke-width="1.5"/>
+  <text x="600" y="80" font-size="13" font-weight="700" fill="#d2a8ff">병합 전략 (keys_type별)</text>
+
+  <text x="616" y="106" font-size="11" fill="#d2a8ff" font-family="monospace">PRIMARY_KEYS</text><text x="770" y="106" font-size="11" fill="#8b949e">UnionIterator + Delete Vector</text>
+  <text x="616" y="126" font-size="11" fill="#d2a8ff" font-family="monospace">DUP_KEYS</text><text x="770" y="126" font-size="11" fill="#8b949e">UnionIterator (중복 허용)</text>
+  <text x="616" y="146" font-size="11" fill="#d2a8ff" font-family="monospace">UNIQUE_KEYS</text><text x="770" y="146" font-size="11" fill="#8b949e">AggregateIter(HeapMerge) 중복 제거</text>
+  <text x="616" y="166" font-size="11" fill="#d2a8ff" font-family="monospace">AGG_KEYS</text><text x="770" y="166" font-size="11" fill="#8b949e">AggregateIter(HeapMerge) 집계</text>
+
+  <text x="600" y="196" font-size="12" font-weight="600" fill="#ffa657">Compaction 전용:</text>
+  <text x="616" y="216" font-size="11" fill="#ffa657" font-family="monospace">Horizontal</text><text x="770" y="216" font-size="11" fill="#8b949e">HeapMergeIterator</text>
+  <text x="616" y="236" font-size="11" fill="#ffa657" font-family="monospace">Vertical</text><text x="770" y="236" font-size="11" fill="#8b949e">MaskMergeIterator (source mask)</text>
+
+  <!-- Late materialization -->
+  <rect x="580" y="272" width="470" height="60" rx="8" fill="#161b22" stroke="#e3b341" stroke-width="1.5"/>
+  <text x="600" y="296" font-size="12" font-weight="700" fill="#e3b341">Late Materialization (지연 구체화)</text>
+  <text x="616" y="316" font-size="11" fill="#8b949e">predicate 컬럼만 먼저 읽어 필터 → 통과한 행만 나머지 컬럼 구체화</text>
+
+  <!-- Predicate info -->
+  <rect x="300" y="320" width="260" height="76" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="316" y="342" font-size="12" font-weight="600" fill="#c9d1d9">Predicate 타입</text>
+  <text x="316" y="360" font-size="10" fill="#79c0ff" font-family="monospace">EQ NE GT GE LT LE</text>
+  <text x="316" y="376" font-size="10" fill="#79c0ff" font-family="monospace">InList NotInList</text>
+  <text x="316" y="392" font-size="10" fill="#79c0ff" font-family="monospace">IsNull NotNull And Or Expr</text>
+
+  <!-- 4-2. INDEX EVALUATION ORDER -->
+  <rect x="30" y="430" width="1040" height="370" rx="10" fill="#0d1117" stroke="#f85149" stroke-width="1.5" filter="url(#s4)"/>
+  <text x="50" y="458" font-size="16" font-weight="700" fill="#ff7b72">4-2. 인덱스 평가 순서 (SegmentIterator._init)</text>
+  <text x="50" y="476" font-size="11" fill="#484f58">각 인덱스가 SparseRange를 반환하여 후보 행을 점진적으로 줄인다</text>
+
+  <!-- Index steps -->
+  <rect x="70" y="494" width="40" height="24" rx="4" fill="#484f58"/><text x="90" y="511" font-size="11" fill="#fff" text-anchor="middle">1</text>
+  <text x="120" y="511" font-size="11" fill="#c9d1d9">Rowid Range</text><text x="260" y="511" font-size="11" fill="#8b949e">명시적 rowid 범위 제약</text>
+
+  <rect x="70" y="524" width="40" height="24" rx="4" fill="#f0883e"/><text x="90" y="541" font-size="11" fill="#fff" text-anchor="middle">2</text>
+  <text x="120" y="541" font-size="11" fill="#ffa657" font-weight="600">Short Key Index</text><text x="260" y="541" font-size="11" fill="#8b949e">키 prefix lower/upper bound</text>
+
+  <rect x="70" y="554" width="40" height="24" rx="4" fill="#484f58"/><text x="90" y="571" font-size="11" fill="#fff" text-anchor="middle">3</text>
+  <text x="120" y="571" font-size="11" fill="#c9d1d9">Tablet Range</text><text x="260" y="571" font-size="11" fill="#8b949e">tablet 범위 predicate</text>
+
+  <rect x="70" y="584" width="40" height="24" rx="4" fill="#da3633"/><text x="90" y="601" font-size="11" fill="#fff" text-anchor="middle">4</text>
+  <text x="120" y="601" font-size="11" fill="#ff7b72">Delete Vector</text><text x="260" y="601" font-size="11" fill="#8b949e">[선택적] PK 테이블 조기 적용</text>
+
+  <rect x="70" y="614" width="40" height="24" rx="4" fill="#8957e5"/><text x="90" y="631" font-size="11" fill="#fff" text-anchor="middle">5</text>
+  <text x="120" y="631" font-size="11" fill="#d2a8ff" font-weight="600">Bitmap Index</text><text x="260" y="631" font-size="11" fill="#8b949e">딕셔너리 기반 필터링</text>
+
+  <rect x="70" y="644" width="40" height="24" rx="4" fill="#238636"/><text x="90" y="661" font-size="11" fill="#fff" text-anchor="middle">6</text>
+  <text x="120" y="661" font-size="11" fill="#7ee787" font-weight="600">Zone Map Index</text><text x="260" y="661" font-size="11" fill="#8b949e">페이지별 min/max pruning</text>
+
+  <rect x="70" y="674" width="40" height="24" rx="4" fill="#1f6feb"/><text x="90" y="691" font-size="11" fill="#fff" text-anchor="middle">7</text>
+  <text x="120" y="691" font-size="11" fill="#79c0ff" font-weight="600">Bloom Filter</text><text x="260" y="691" font-size="11" fill="#8b949e">존재 여부 확률적 체크</text>
+
+  <rect x="70" y="704" width="40" height="24" rx="4" fill="#484f58"/><text x="90" y="721" font-size="11" fill="#fff" text-anchor="middle">8</text>
+  <text x="120" y="721" font-size="11" fill="#c9d1d9">Inverted Index</text><text x="260" y="721" font-size="11" fill="#8b949e">텍스트 검색</text>
+
+  <rect x="70" y="734" width="40" height="24" rx="4" fill="#da3633"/><text x="90" y="751" font-size="11" fill="#fff" text-anchor="middle">9</text>
+  <text x="120" y="751" font-size="11" fill="#ff7b72">Delete Vector</text><text x="260" y="751" font-size="11" fill="#8b949e">[선택적] 지연 적용 시</text>
+
+  <rect x="70" y="764" width="40" height="24" rx="4" fill="#484f58"/><text x="90" y="781" font-size="11" fill="#fff" text-anchor="middle">10</text>
+  <text x="120" y="781" font-size="11" fill="#c9d1d9">Vector Index</text><text x="260" y="781" font-size="11" fill="#8b949e">ANN/유사도 검색</text>
+
+  <!-- Pruning visualization -->
+  <rect x="560" y="494" width="490" height="295" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="580" y="518" font-size="13" font-weight="700" fill="#c9d1d9">Pruning 시각화</text>
+
+  <rect x="590" y="534" width="430" height="22" rx="3" fill="#da3633" opacity="0.3"/>
+  <rect x="590" y="534" width="430" height="22" rx="3" fill="none" stroke="#da3633" stroke-width="1"/>
+  <text x="805" y="549" font-size="10" fill="#ff7b72" text-anchor="middle">전체 행 (100%)</text>
+
+  <rect x="590" y="564" width="340" height="22" rx="3" fill="#f0883e" opacity="0.3"/>
+  <rect x="590" y="564" width="340" height="22" rx="3" fill="none" stroke="#f0883e" stroke-width="1"/>
+  <text x="760" y="579" font-size="10" fill="#ffa657" text-anchor="middle">Short Key 적용 후 (~70%)</text>
+
+  <rect x="590" y="594" width="240" height="22" rx="3" fill="#8957e5" opacity="0.3"/>
+  <rect x="590" y="594" width="240" height="22" rx="3" fill="none" stroke="#8957e5" stroke-width="1"/>
+  <text x="710" y="609" font-size="10" fill="#d2a8ff" text-anchor="middle">Bitmap 적용 후 (~40%)</text>
+
+  <rect x="590" y="624" width="160" height="22" rx="3" fill="#238636" opacity="0.3"/>
+  <rect x="590" y="624" width="160" height="22" rx="3" fill="none" stroke="#238636" stroke-width="1"/>
+  <text x="670" y="639" font-size="10" fill="#7ee787" text-anchor="middle">ZoneMap 후 (~20%)</text>
+
+  <rect x="590" y="654" width="100" height="22" rx="3" fill="#1f6feb" opacity="0.3"/>
+  <rect x="590" y="654" width="100" height="22" rx="3" fill="none" stroke="#1f6feb" stroke-width="1"/>
+  <text x="640" y="669" font-size="10" fill="#79c0ff" text-anchor="middle">Bloom (~10%)</text>
+
+  <rect x="590" y="684" width="60" height="22" rx="3" fill="#7ee787" opacity="0.3"/>
+  <rect x="590" y="684" width="60" height="22" rx="3" fill="none" stroke="#7ee787" stroke-width="1"/>
+  <text x="620" y="699" font-size="10" fill="#7ee787" text-anchor="middle">결과</text>
+
+  <text x="590" y="734" font-size="11" fill="#ffa657">핵심:</text><text x="635" y="734" font-size="11" fill="#8b949e">각 인덱스는 pessimistic — 필터 불가 시 전체 통과</text>
+  <text x="635" y="754" font-size="11" fill="#8b949e">후속 인덱스는 이전 결과와 교집합(intersect)</text>
+  <text x="635" y="774" font-size="11" fill="#8b949e">Dict 최적화: predicate를 정수 코드로 변환 → 빠른 필터</text>
+
+  <!-- 4-3. DELETE VECTOR -->
+  <rect x="30" y="820" width="500" height="160" rx="10" fill="#0d1117" stroke="#da3633" stroke-width="1.5" filter="url(#s4)"/>
+  <text x="50" y="848" font-size="16" font-weight="700" fill="#ff7b72">4-3. Delete Vector (PK 테이블)</text>
+  <text x="50" y="866" font-size="11" fill="#484f58">storage/del_vector.h — Roaring Bitmap</text>
+
+  <text x="66" y="894" font-size="11" fill="#ff7b72" font-family="monospace">DelVector {</text>
+  <text x="82" y="912" font-size="11" fill="#ff7b72" font-family="monospace">  _version</text><text x="200" y="912" font-size="11" fill="#8b949e">int64 — 버전</text>
+  <text x="82" y="930" font-size="11" fill="#ff7b72" font-family="monospace">  _roaring</text><text x="200" y="930" font-size="11" fill="#8b949e">shared_ptr&lt;Roaring&gt; — 삭제 행 bitmap</text>
+  <text x="66" y="948" font-size="11" fill="#ff7b72" font-family="monospace">}</text>
+  <text x="66" y="972" font-size="11" fill="#8b949e">_apply_del_vector() → _scan_range에서 삭제 rowid 제거</text>
+
+  <!-- Chunk-based reading -->
+  <rect x="560" y="820" width="510" height="160" rx="10" fill="#0d1117" stroke="#e3b341" stroke-width="1.5" filter="url(#s4)"/>
+  <text x="580" y="848" font-size="16" font-weight="700" fill="#e3b341">4-4. Chunk 기반 읽기</text>
+
+  <text x="580" y="876" font-size="11" fill="#e3b341">ChunkIterator 인터페이스:</text>
+  <text x="596" y="896" font-size="11" fill="#79c0ff" font-family="monospace">get_next(Chunk* chunk)</text><text x="800" y="896" font-size="11" fill="#8b949e">기본 반환</text>
+  <text x="596" y="914" font-size="11" fill="#79c0ff" font-family="monospace">get_next(chunk, rowid)</text><text x="800" y="914" font-size="11" fill="#8b949e">rowid 포함</text>
+  <text x="596" y="932" font-size="11" fill="#79c0ff" font-family="monospace">get_next(chunk, source_masks)</text><text x="830" y="932" font-size="11" fill="#8b949e">merge용</text>
+
+  <text x="596" y="960" font-size="11" fill="#8b949e">기본 chunk_size: 4096행</text>
+  <text x="596" y="978" font-size="11" fill="#8b949e">_scan_range(SparseRange)를 순회하며 읽기</text>
+</svg>
+
+<hr class="divider"/>
+
+<!-- ================================================================== -->
+<!-- PART 5: COMPACTION + ROWSET MVCC                                   -->
+<!-- ================================================================== -->
+
+<h2>Part 5 — Compaction + Rowset MVCC</h2>
+<p class="section-desc">다중 rowset 병합과 동시 읽기/쓰기를 가능케 하는 버전 관리 메커니즘</p>
+
+<svg width="1100" height="2020" viewBox="0 0 1100 2020" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="a5" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#484f58"/></marker>
+    <marker id="a5r" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#da3633"/></marker>
+    <marker id="a5g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#238636"/></marker>
+    <filter id="s5"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.4"/></filter>
+  </defs>
+
+  <!-- ============================================================ -->
+  <!-- 5-1. ROWSET MVCC                                             -->
+  <!-- ============================================================ -->
+  <rect x="30" y="10" width="1040" height="680" rx="10" fill="#0d1117" stroke="#58a6ff" stroke-width="1.5" filter="url(#s5)"/>
+  <text x="50" y="38" font-size="16" font-weight="700" fill="#58a6ff">5-1. Rowset MVCC (Multi-Version Concurrency Control)</text>
+  <text x="50" y="56" font-size="11" fill="#484f58">Compaction 중에도 읽기가 일관된 스냅샷을 볼 수 있도록 보장</text>
+
+  <!-- Three maps -->
+  <rect x="70" y="74" width="480" height="230" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="90" y="98" font-size="14" font-weight="700" fill="#58a6ff">세 가지 버전 맵 (tablet.h)</text>
+
+  <rect x="86" y="112" width="448" height="52" rx="6" fill="#1a3a2e" stroke="#238636"/>
+  <text x="102" y="132" font-size="12" font-weight="600" fill="#7ee787">_rs_version_map</text><text x="260" y="132" font-size="11" fill="#8b949e">map&lt;Version, Rowset&gt;</text>
+  <text x="102" y="152" font-size="11" fill="#8b949e">활성 rowset — 새 쿼리가 사용하는 현재 버전</text>
+
+  <rect x="86" y="172" width="448" height="52" rx="6" fill="#2a1a1a" stroke="#da3633"/>
+  <text x="102" y="192" font-size="12" font-weight="600" fill="#ff7b72">_stale_rs_version_map</text><text x="290" y="192" font-size="11" fill="#8b949e">unordered_map</text>
+  <text x="102" y="212" font-size="11" fill="#8b949e">compaction 전 rowset — 기존 reader가 참조 가능 (MVCC 핵심)</text>
+
+  <rect x="86" y="232" width="448" height="52" rx="6" fill="#1a1a2e" stroke="#8957e5"/>
+  <text x="102" y="252" font-size="12" font-weight="600" fill="#d2a8ff">_inc_rs_version_map</text><text x="290" y="252" font-size="11" fill="#8b949e">unordered_map</text>
+  <text x="102" y="272" font-size="11" fill="#8b949e">증분 rowset — clone 작업용</text>
+
+  <!-- Snapshot capture flow -->
+  <rect x="580" y="74" width="470" height="230" rx="8" fill="#161b22" stroke="#7ee787" stroke-width="1.5"/>
+  <text x="600" y="98" font-size="14" font-weight="700" fill="#7ee787">MVCC 스냅샷 캡처 과정</text>
+
+  <text x="616" y="122" font-size="11" fill="#79c0ff">1. Reader가 version [0-100] 요청</text>
+  <text x="616" y="146" font-size="11" fill="#79c0ff">2. capture_consistent_versions()</text>
+  <text x="632" y="164" font-size="11" fill="#8b949e">VersionGraph에서 [0-100] 커버 경로 탐색</text>
+  <text x="632" y="182" font-size="11" fill="#8b949e">예: [0-50](compacted) + [51-80] + [81-100]</text>
+  <text x="616" y="206" font-size="11" fill="#79c0ff">3. _capture_consistent_rowsets_unlocked()</text>
+  <text x="632" y="224" font-size="11" fill="#7ee787">① _rs_version_map에서 먼저 검색</text>
+  <text x="632" y="242" font-size="11" fill="#ff7b72">② 없으면 _stale_rs_version_map 검색 (fallback)</text>
+  <text x="616" y="268" font-size="11" fill="#79c0ff">4. Rowset 집합 반환 → Reader가 스캔</text>
+  <text x="632" y="286" font-size="11" fill="#8b949e">_meta_lock(shared_lock)으로 thread-safe</text>
+
+  <!-- MVCC Timeline -->
+  <rect x="70" y="320" width="980" height="354" rx="8" fill="#161b22" stroke="#ffa657" stroke-width="1.5"/>
+  <text x="90" y="344" font-size="14" font-weight="700" fill="#ffa657">MVCC 동작 타임라인</text>
+
+  <!-- Time axis -->
+  <line x1="90" y1="370" x2="1020" y2="370" stroke="#484f58" stroke-width="1"/>
+  <text x="90" y="388" font-size="10" fill="#484f58">T1</text>
+  <text x="350" y="388" font-size="10" fill="#484f58">T2 (Compaction)</text>
+  <text x="620" y="388" font-size="10" fill="#484f58">T3 (완료)</text>
+  <text x="860" y="388" font-size="10" fill="#484f58">T4 (GC)</text>
+
+  <!-- Active map row -->
+  <text x="90" y="416" font-size="11" font-weight="600" fill="#7ee787">Active Map:</text>
+  <rect x="220" y="402" width="56" height="20" rx="3" fill="#238636"/><text x="248" y="416" font-size="9" fill="#fff" text-anchor="middle">[0-50]</text>
+  <rect x="280" y="402" width="56" height="20" rx="3" fill="#238636"/><text x="308" y="416" font-size="9" fill="#fff" text-anchor="middle">[51-60]</text>
+  <rect x="340" y="402" width="56" height="20" rx="3" fill="#238636"/><text x="368" y="416" font-size="9" fill="#fff" text-anchor="middle">[61-70]</text>
+  <rect x="400" y="402" width="56" height="20" rx="3" fill="#238636"/><text x="428" y="416" font-size="9" fill="#fff" text-anchor="middle">[71-80]</text>
+
+  <!-- Compaction arrow -->
+  <text x="480" y="416" font-size="11" fill="#ffa657">→ compaction →</text>
+
+  <rect x="620" y="402" width="56" height="20" rx="3" fill="#238636"/><text x="648" y="416" font-size="9" fill="#fff" text-anchor="middle">[0-50]</text>
+  <rect x="680" y="402" width="56" height="20" rx="3" fill="#1f6feb"/><text x="708" y="416" font-size="9" fill="#fff" text-anchor="middle">[51-70]</text>
+  <rect x="740" y="402" width="56" height="20" rx="3" fill="#238636"/><text x="768" y="416" font-size="9" fill="#fff" text-anchor="middle">[71-80]</text>
+  <text x="810" y="416" font-size="10" fill="#1f6feb">← 새 compacted rowset</text>
+
+  <!-- Stale map row -->
+  <text x="90" y="454" font-size="11" font-weight="600" fill="#ff7b72">Stale Map:</text>
+  <text x="220" y="454" font-size="11" fill="#484f58">(비어있음)</text>
+  <rect x="620" y="440" width="56" height="20" rx="3" fill="#da3633"/><text x="648" y="454" font-size="9" fill="#fff" text-anchor="middle">[51-60]</text>
+  <rect x="680" y="440" width="56" height="20" rx="3" fill="#da3633"/><text x="708" y="454" font-size="9" fill="#fff" text-anchor="middle">[61-70]</text>
+  <text x="750" y="454" font-size="10" fill="#da3633">← 이전 rowset 보존</text>
+
+  <!-- Reader A -->
+  <rect x="90" y="478" width="600" height="36" rx="4" fill="#1a2a3e" stroke="#79c0ff" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="100" y="500" font-size="11" fill="#79c0ff">Reader A: snapshot [0-50] [51-60] [61-70] [71-80] — T1에서 캡처</text>
+
+  <text x="700" y="500" font-size="11" fill="#7ee787">stale map에서</text>
+  <text x="700" y="516" font-size="11" fill="#7ee787">[51-60][61-70] 찾음</text>
+
+  <!-- Reader B -->
+  <rect x="540" y="524" width="490" height="36" rx="4" fill="#1a3a2e" stroke="#7ee787" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="550" y="546" font-size="11" fill="#7ee787">Reader B: snapshot [0-50] [51-70] [71-80] — T3에서 캡처 (새 버전 사용)</text>
+
+  <!-- GC -->
+  <rect x="860" y="570" width="170" height="36" rx="4" fill="#2a1a1a" stroke="#da3633"/>
+  <text x="870" y="590" font-size="11" fill="#ff7b72">GC: [51-60][61-70] 삭제</text>
+
+  <!-- Arrows -->
+  <text x="860" y="620" font-size="10" fill="#8b949e">TTL 만료 (기본 1800초)</text>
+  <text x="860" y="636" font-size="10" fill="#8b949e">Reader A 완료 후 안전 삭제</text>
+
+  <!-- Key guarantees box -->
+  <text x="90" y="660" font-size="12" font-weight="600" fill="#ffa657">핵심 보장:</text>
+  <text x="220" y="660" font-size="11" fill="#8b949e">Compaction이 active map을 교체해도 stale map에 이전 rowset 보존 → 기존 reader 스냅샷 무효화 없음</text>
+
+  <!-- ============================================================ -->
+  <!-- 5-2. COMPACTION OVERVIEW                                     -->
+  <!-- ============================================================ -->
+  <rect x="30" y="710" width="1040" height="340" rx="10" fill="#0d1117" stroke="#d29922" stroke-width="1.5" filter="url(#s5)"/>
+  <text x="50" y="738" font-size="16" font-weight="700" fill="#e3b341">5-2. Compaction 개요</text>
+
+  <!-- Visual: cumulative point -->
+  <rect x="70" y="756" width="980" height="110" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="90" y="780" font-size="13" font-weight="700" fill="#e3b341">Cumulative Point 경계</text>
+
+  <!-- Base layer -->
+  <rect x="100" y="798" width="320" height="40" rx="6" fill="#1a2a3e" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="260" y="822" font-size="12" fill="#79c0ff" text-anchor="middle">Base Layer (compacted, 큰 rowset)</text>
+  <rect x="116" y="808" width="80" height="20" rx="3" fill="#1f6feb"/><text x="156" y="822" font-size="9" fill="#fff" text-anchor="middle">[0-50]</text>
+
+  <!-- Divider -->
+  <line x1="440" y1="790" x2="440" y2="850" stroke="#e3b341" stroke-width="2" stroke-dasharray="4,2"/>
+  <text x="440" y="860" font-size="10" fill="#e3b341" text-anchor="middle">cumulative_point</text>
+
+  <!-- Cumulative layer -->
+  <rect x="460" y="798" width="560" height="40" rx="6" fill="#1a3a2e" stroke="#238636" stroke-width="1.5"/>
+  <text x="740" y="812" font-size="12" fill="#7ee787" text-anchor="middle">Cumulative Layer (작은 rowset들, 자주 compaction)</text>
+  <rect x="476" y="808" width="60" height="20" rx="3" fill="#238636"/><text x="506" y="822" font-size="9" fill="#fff" text-anchor="middle">[51-55]</text>
+  <rect x="542" y="808" width="60" height="20" rx="3" fill="#238636"/><text x="572" y="822" font-size="9" fill="#fff" text-anchor="middle">[56-60]</text>
+  <rect x="608" y="808" width="60" height="20" rx="3" fill="#238636"/><text x="638" y="822" font-size="9" fill="#fff" text-anchor="middle">[61-65]</text>
+  <rect x="674" y="808" width="60" height="20" rx="3" fill="#238636"/><text x="704" y="822" font-size="9" fill="#fff" text-anchor="middle">[66-70]</text>
+
+  <!-- Two compaction types -->
+  <rect x="70" y="884" width="470" height="148" rx="8" fill="#161b22" stroke="#1f6feb" stroke-width="1.5"/>
+  <text x="90" y="910" font-size="13" font-weight="700" fill="#79c0ff">Base Compaction</text>
+  <text x="270" y="910" font-size="10" fill="#484f58">storage/base_compaction.h</text>
+  <text x="106" y="934" font-size="11" fill="#79c0ff">대상:</text><text x="150" y="934" font-size="11" fill="#8b949e">start_version &lt; cumulative_point</text>
+  <text x="106" y="952" font-size="11" fill="#79c0ff">빈도:</text><text x="150" y="952" font-size="11" fill="#8b949e">드물게 (큰 데이터 이동)</text>
+  <text x="106" y="970" font-size="11" fill="#79c0ff">출력:</text><text x="150" y="970" font-size="11" fill="#8b949e">단일 compacted rowset</text>
+  <text x="106" y="994" font-size="11" fill="#ffa657">트리거:</text>
+  <text x="166" y="994" font-size="10" fill="#8b949e">rowset 수 임계값 / 비율 초과 / 시간 초과</text>
+  <text x="106" y="1014" font-size="11" fill="#ffa657">제약:</text>
+  <text x="166" y="1014" font-size="10" fill="#8b949e">입력 segment 겹침 불허</text>
+
+  <rect x="580" y="884" width="470" height="148" rx="8" fill="#161b22" stroke="#238636" stroke-width="1.5"/>
+  <text x="600" y="910" font-size="13" font-weight="700" fill="#7ee787">Cumulative Compaction</text>
+  <text x="810" y="910" font-size="10" fill="#484f58">storage/cumulative_compaction.h</text>
+  <text x="616" y="934" font-size="11" fill="#7ee787">대상:</text><text x="660" y="934" font-size="11" fill="#8b949e">start_version >= cumulative_point</text>
+  <text x="616" y="952" font-size="11" fill="#7ee787">빈도:</text><text x="660" y="952" font-size="11" fill="#8b949e">자주 (작은 rowset 빠르게 병합)</text>
+  <text x="616" y="970" font-size="11" fill="#7ee787">출력:</text><text x="660" y="970" font-size="11" fill="#8b949e">병합된 rowset</text>
+  <text x="616" y="994" font-size="11" fill="#ffa657">완료 후:</text>
+  <text x="686" y="994" font-size="10" fill="#8b949e">cumulative_point = input.last.end + 1</text>
+  <text x="616" y="1014" font-size="11" fill="#ffa657">중단 조건:</text>
+  <text x="694" y="1014" font-size="10" fill="#8b949e">singleton / overlap / delete 버전</text>
+
+  <!-- ============================================================ -->
+  <!-- 5-3. COMPACTION FLOW                                         -->
+  <!-- ============================================================ -->
+  <rect x="30" y="1070" width="1040" height="540" rx="10" fill="#0d1117" stroke="#f0883e" stroke-width="1.5" filter="url(#s5)"/>
+  <text x="50" y="1098" font-size="16" font-weight="700" fill="#ffa657">5-3. Compaction 실행 흐름</text>
+
+  <!-- Phase 1 -->
+  <rect x="70" y="1118" width="460" height="96" rx="8" fill="#161b22" stroke="#e3b341" stroke-width="1.5"/>
+  <rect x="70" y="1118" width="460" height="24" rx="8" fill="#e3b341"/><rect x="70" y="1130" width="460" height="12" fill="#e3b341"/>
+  <text x="86" y="1135" font-size="12" font-weight="700" fill="#0d1117">Phase 1: Pick Rowsets</text>
+  <text x="86" y="1162" font-size="11" fill="#8b949e">pick_candidate_rowsets_to_[base|cumulative]_compaction()</text>
+  <text x="86" y="1180" font-size="11" fill="#8b949e">_rs_version_map에서 cumulative_point 기준 필터</text>
+  <text x="86" y="1198" font-size="11" fill="#8b949e">버전 연속성 검증, 정책 기반 선택</text>
+
+  <line x1="300" y1="1214" x2="300" y2="1232" stroke="#484f58" stroke-width="1.5" marker-end="url(#a5)"/>
+
+  <!-- Phase 2 -->
+  <rect x="70" y="1232" width="460" height="116" rx="8" fill="#161b22" stroke="#238636" stroke-width="1.5"/>
+  <rect x="70" y="1232" width="460" height="24" rx="8" fill="#238636"/><rect x="70" y="1244" width="460" height="12" fill="#238636"/>
+  <text x="86" y="1249" font-size="12" font-weight="700" fill="#fff">Phase 2: Merge</text>
+  <text x="86" y="1276" font-size="11" fill="#8b949e">output_version = [input_first.start, input_last.end]</text>
+  <text x="86" y="1296" font-size="11" fill="#7ee787">TabletReader</text><text x="180" y="1296" font-size="11" fill="#8b949e">→ 입력 rowset에서 데이터 읽기</text>
+  <text x="86" y="1316" font-size="11" fill="#7ee787">RowsetWriter</text><text x="180" y="1316" font-size="11" fill="#8b949e">→ 병합 데이터를 새 세그먼트에 기록</text>
+  <text x="86" y="1336" font-size="11" fill="#8b949e">필터, 삭제, 갱신 적용 (PK: delete vector 처리)</text>
+
+  <line x1="300" y1="1348" x2="300" y2="1366" stroke="#484f58" stroke-width="1.5" marker-end="url(#a5)"/>
+
+  <!-- Phase 3 -->
+  <rect x="70" y="1366" width="460" height="116" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+  <rect x="70" y="1366" width="460" height="24" rx="8" fill="#1f6feb"/><rect x="70" y="1378" width="460" height="12" fill="#1f6feb"/>
+  <text x="86" y="1383" font-size="12" font-weight="700" fill="#fff">Phase 3: Modify Rowsets (Atomic Swap)</text>
+  <text x="86" y="1410" font-size="11" fill="#79c0ff">wrlock(_meta_lock)</text>
+  <text x="86" y="1428" font-size="11" fill="#8b949e">modify_rowsets_without_lock({output}, inputs)</text>
+  <text x="86" y="1446" font-size="11" fill="#7ee787">_rs_version_map:</text><text x="210" y="1446" font-size="11" fill="#8b949e">입력 제거, 출력 추가</text>
+  <text x="86" y="1464" font-size="11" fill="#ff7b72">_stale_rs_version_map:</text><text x="250" y="1464" font-size="11" fill="#8b949e">입력 rowset 이동 (MVCC)</text>
+
+  <line x1="300" y1="1482" x2="300" y2="1500" stroke="#484f58" stroke-width="1.5" marker-end="url(#a5)"/>
+
+  <!-- Phase 4 -->
+  <rect x="70" y="1500" width="460" height="92" rx="8" fill="#161b22" stroke="#da3633" stroke-width="1.5"/>
+  <rect x="70" y="1500" width="460" height="24" rx="8" fill="#da3633"/><rect x="70" y="1512" width="460" height="12" fill="#da3633"/>
+  <text x="86" y="1517" font-size="12" font-weight="700" fill="#fff">Phase 4: Cleanup (GC)</text>
+  <text x="86" y="1544" font-size="11" fill="#8b949e">delete_expired_stale_rowset()</text>
+  <text x="86" y="1562" font-size="11" fill="#8b949e">TimestampedVersionTracker → 만료 경로 조회</text>
+  <text x="86" y="1580" font-size="11" fill="#8b949e">_stale_rs_version_map 제거 → 물리 삭제</text>
+
+  <!-- Compaction policies -->
+  <rect x="580" y="1118" width="470" height="180" rx="8" fill="#161b22" stroke="#d2a8ff" stroke-width="1.5"/>
+  <text x="600" y="1142" font-size="13" font-weight="700" fill="#d2a8ff">Compaction 정책</text>
+
+  <text x="616" y="1168" font-size="12" font-weight="600" fill="#79c0ff">Default Policy</text>
+  <text x="616" y="1186" font-size="11" fill="#8b949e">2계층: Base + Cumulative</text>
+  <text x="616" y="1204" font-size="11" fill="#8b949e">고정 cumulative_point, 크기/시간 트리거</text>
+
+  <text x="616" y="1232" font-size="12" font-weight="600" fill="#7ee787">Size-Tiered Policy</text>
+  <text x="616" y="1250" font-size="11" fill="#8b949e">크기 기반 다중 레벨 (Level 0 → N)</text>
+  <text x="616" y="1268" font-size="11" fill="#8b949e">레벨 크기 임계값 초과 시 트리거</text>
+  <text x="616" y="1286" font-size="11" fill="#8b949e">score = segment_num + data_bonus</text>
+
+  <!-- CompactionManager -->
+  <rect x="580" y="1314" width="470" height="150" rx="8" fill="#161b22" stroke="#ffa657" stroke-width="1.5"/>
+  <text x="600" y="1338" font-size="13" font-weight="700" fill="#ffa657">CompactionManager</text>
+  <text x="780" y="1338" font-size="10" fill="#484f58">storage/compaction_manager.h</text>
+
+  <text x="616" y="1366" font-size="11" fill="#ffa657" font-family="monospace">_compaction_candidates</text><text x="810" y="1366" font-size="11" fill="#8b949e">우선순위 큐</text>
+  <text x="616" y="1386" font-size="11" fill="#ffa657" font-family="monospace">_running_tasks</text><text x="810" y="1386" font-size="11" fill="#8b949e">실행 중 작업</text>
+  <text x="616" y="1406" font-size="11" fill="#ffa657" font-family="monospace">thread_pool</text><text x="810" y="1406" font-size="11" fill="#8b949e">실행용 스레드 풀</text>
+
+  <text x="616" y="1434" font-size="11" fill="#8b949e">점수 기반 후보 선택 → max_compaction_concurrency 제한</text>
+  <text x="616" y="1452" font-size="11" fill="#8b949e">전제: 마이그레이션 중 아님, 비활성화 아님</text>
+
+  <!-- PK Compaction -->
+  <rect x="580" y="1480" width="470" height="112" rx="8" fill="#161b22" stroke="#ff7b72" stroke-width="1.5"/>
+  <text x="600" y="1504" font-size="13" font-weight="700" fill="#ff7b72">Primary Key 테이블 Compaction 특이사항</text>
+
+  <text x="616" y="1530" font-size="11" fill="#ff7b72" font-family="monospace">Delete Vector</text><text x="760" y="1530" font-size="11" fill="#8b949e">각 rowset의 삭제 행 추적, compaction 시 적용</text>
+  <text x="616" y="1550" font-size="11" fill="#ff7b72" font-family="monospace">Conflict Resolver</text><text x="760" y="1550" font-size="11" fill="#8b949e">같은 키 → 나중 버전 우선 (latest wins)</text>
+  <text x="616" y="1570" font-size="11" fill="#ff7b72" font-family="monospace">PK Index 재구축</text><text x="760" y="1570" font-size="11" fill="#8b949e">출력 rowset에 키 인덱스 재생성</text>
+  <text x="616" y="1580" font-size="11" fill="#484f58">primary_key_compaction_conflict_resolver.h</text>
+
+  <!-- ============================================================ -->
+  <!-- 5-4. CUMULATIVE POINT CALCULATION                            -->
+  <!-- ============================================================ -->
+  <rect x="30" y="1616" width="1040" height="200" rx="10" fill="#0d1117" stroke="#e3b341" stroke-width="1.5" filter="url(#s5)"/>
+  <text x="50" y="1644" font-size="16" font-weight="700" fill="#e3b341">5-4. Cumulative Point 계산 (tablet.cpp)</text>
+
+  <text x="70" y="1672" font-size="11" fill="#8b949e">1. 모든 rowset을 start_version 오름차순 정렬</text>
+  <text x="70" y="1692" font-size="11" fill="#8b949e">2. version -1부터 연속성 검사하며 순회</text>
+  <text x="70" y="1712" font-size="11" fill="#8b949e">3. 멈추는 조건: 버전 hole / segment 겹침 / singleton (비-delete)</text>
+  <text x="70" y="1732" font-size="11" fill="#8b949e">4. 멈춘 rowset의 start_version = cumulative_point</text>
+
+  <!-- Example -->
+  <rect x="580" y="1660" width="470" height="138" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="600" y="1684" font-size="12" font-weight="600" fill="#e3b341">예시:</text>
+  <rect x="610" y="1694" width="50" height="18" rx="3" fill="#1f6feb"/><text x="635" y="1707" font-size="9" fill="#fff" text-anchor="middle">[0-5]</text>
+  <rect x="666" y="1694" width="50" height="18" rx="3" fill="#1f6feb"/><text x="691" y="1707" font-size="9" fill="#fff" text-anchor="middle">[6-8]</text>
+  <rect x="722" y="1694" width="50" height="18" rx="3" fill="#1f6feb"/><text x="747" y="1707" font-size="9" fill="#fff" text-anchor="middle">[9-10]</text>
+  <rect x="778" y="1694" width="56" height="18" rx="3" fill="#1f6feb"/><text x="806" y="1707" font-size="9" fill="#fff" text-anchor="middle">[11-12]</text>
+  <rect x="840" y="1694" width="56" height="18" rx="3" fill="#da3633"/><text x="868" y="1707" font-size="9" fill="#fff" text-anchor="middle">[13-15]</text>
+  <text x="902" y="1707" font-size="9" fill="#ff7b72">← overlap</text>
+
+  <line x1="838" y1="1720" x2="838" y2="1740" stroke="#e3b341" stroke-width="2" stroke-dasharray="3,2"/>
+  <text x="838" y="1756" font-size="10" fill="#e3b341" text-anchor="middle">cumulative_point = 13</text>
+
+  <text x="610" y="1778" font-size="10" fill="#79c0ff">Base:</text><text x="648" y="1778" font-size="10" fill="#8b949e">[0-5] [6-8] [9-10] [11-12]</text>
+  <text x="610" y="1794" font-size="10" fill="#7ee787">Cumulative:</text><text x="688" y="1794" font-size="10" fill="#8b949e">[13-15]</text>
+
+  <!-- ============================================================ -->
+  <!-- 5-5. VERSION STRUCTURE                                       -->
+  <!-- ============================================================ -->
+  <rect x="30" y="1836" width="1040" height="166" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1.5" filter="url(#s5)"/>
+  <text x="50" y="1864" font-size="16" font-weight="700" fill="#c9d1d9">5-5. Version 구조 (olap_common.h)</text>
+
+  <rect x="70" y="1882" width="470" height="100" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="86" y="1904" font-size="11" fill="#79c0ff" font-family="monospace">struct Version {</text>
+  <text x="102" y="1922" font-size="11" fill="#79c0ff" font-family="monospace">  int64_t first;</text><text x="260" y="1922" font-size="11" fill="#8b949e">// start version (inclusive)</text>
+  <text x="102" y="1940" font-size="11" fill="#79c0ff" font-family="monospace">  int64_t second;</text><text x="260" y="1940" font-size="11" fill="#8b949e">// end version (inclusive)</text>
+  <text x="86" y="1958" font-size="11" fill="#79c0ff" font-family="monospace">};</text>
+  <text x="86" y="1978" font-size="11" fill="#8b949e">FE가 순차 할당, 빈틈(gap) 불허</text>
+
+  <rect x="580" y="1882" width="470" height="100" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="600" y="1906" font-size="12" font-weight="600" fill="#c9d1d9">관련 구조체:</text>
+  <text x="616" y="1928" font-size="11" fill="#79c0ff" font-family="monospace">VersionGraph</text><text x="760" y="1928" font-size="11" fill="#8b949e">버전 DAG (version_graph.h)</text>
+  <text x="616" y="1948" font-size="11" fill="#79c0ff" font-family="monospace">TimestampedVersionTracker</text><text x="830" y="1948" font-size="11" fill="#8b949e">GC용</text>
+  <text x="616" y="1968" font-size="11" fill="#79c0ff" font-family="monospace">TimestampedVersion</text><text x="790" y="1968" font-size="11" fill="#8b949e">version + 생성 시간</text>
+
+</svg>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-color" style="background:#238636"></div>Active / Cumulative</div>
+  <div class="legend-item"><div class="legend-color" style="background:#1f6feb"></div>Base / Compacted</div>
+  <div class="legend-item"><div class="legend-color" style="background:#da3633"></div>Stale / Delete</div>
+  <div class="legend-item"><div class="legend-color" style="background:#e3b341"></div>Cumulative Point / Policy</div>
+  <div class="legend-item"><div class="legend-color" style="background:#f0883e"></div>Compaction Flow</div>
+  <div class="legend-item"><div class="legend-color" style="background:#d2a8ff"></div>MVCC / Merge Strategy</div>
+</div>
+
+</body>
+</html>
